@@ -145,11 +145,13 @@ final class LLMRunner {
         memset(up, 0, ctx * MemoryLayout<UInt16>.stride)
         up[position] = 0x3C00
 
-        let imgEmb = imageEmbedding ?? (try {
-            let a = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
-            memset(a.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
-            return a
-        }())
+        let imgEmb: MLMultiArray
+        if let imageEmbedding {
+            imgEmb = imageEmbedding
+        } else {
+            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
+            memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
+        }
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "input_ids": MLFeatureValue(multiArray: ids),
