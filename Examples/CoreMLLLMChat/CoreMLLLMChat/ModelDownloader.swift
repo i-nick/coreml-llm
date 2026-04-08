@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Downloads and caches CoreML models from GitHub Releases.
 @Observable
@@ -14,38 +17,30 @@ final class ModelDownloader {
         let id: String
         let name: String
         let size: String
-        let baseURL: String  // GitHub release base URL
+        let downloadURL: String
         let folderName: String
-        /// Files to download: (relativePath, sizeBytes)
-        let files: [(String, Int)]
 
         static let defaults: [ModelInfo] = [
             ModelInfo(
                 id: "qwen2.5-0.5b",
                 name: "Qwen2.5 0.5B",
                 size: "309 MB",
-                baseURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0",
-                folderName: "qwen2.5-0.5b",
-                files: [
-                    ("qwen2.5-0.5b-coreml.zip", 309_000_000),
-                ]
+                downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
+                folderName: "qwen2.5-0.5b"
             ),
         ]
     }
 
-    /// Check if model is already downloaded.
     func isDownloaded(_ model: ModelInfo) -> Bool {
         localModelURL(for: model) != nil
     }
 
-    /// Get the model.mlpackage URL if downloaded.
     func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         let pkg = dir.appendingPathComponent("model.mlpackage")
         return fileManager.fileExists(atPath: pkg.path) ? pkg : nil
     }
 
-    /// Download a model. Returns the model.mlpackage URL.
     func download(_ model: ModelInfo) async throws -> URL {
         if let existing = localModelURL(for: model) { return existing }
 
@@ -54,23 +49,18 @@ final class ModelDownloader {
         status = "Downloading \(model.name)..."
         defer { isDownloading = false }
 
-        let file = model.files[0]
-        guard let url = URL(string: "\(model.baseURL)/\(file.0)") else {
+        guard let url = URL(string: model.downloadURL) else {
             throw DownloadError.invalidURL
         }
 
-        // Download zip
-        let tempFile = try await downloadFile(url)
+        let tempZip = try await downloadFile(url)
 
-        // Extract using Foundation's built-in coordinator
         status = "Extracting..."
         let destDir = modelsDirectory.appendingPathComponent(model.folderName)
         try? fileManager.removeItem(at: destDir)
         try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
-
-        // iOS/macOS: use FileManager to unzip
-        try extractZip(at: tempFile, to: destDir)
-        try? fileManager.removeItem(at: tempFile)
+        try unzipFile(tempZip, to: destDir)
+        try? fileManager.removeItem(at: tempZip)
 
         guard let result = localModelURL(for: model) else {
             throw DownloadError.extractionFailed
@@ -81,7 +71,6 @@ final class ModelDownloader {
         return result
     }
 
-    /// Delete a downloaded model.
     func delete(_ model: ModelInfo) throws {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         if fileManager.fileExists(atPath: dir.path) {
@@ -115,71 +104,102 @@ final class ModelDownloader {
         }
     }
 
-    private func extractZip(at zipURL: URL, to destDir: URL) throws {
-        // Use SSZipArchive-style approach with Foundation
-        // iOS 16+: we can use the process-less approach
-        #if os(macOS)
+    private func unzipFile(_ zipURL: URL, to destDir: URL) throws {
+        // Use /usr/bin/ditto (available on both macOS and iOS simulators)
+        // For real iOS devices, we use a minimal Swift ZIP implementation
+        #if targetEnvironment(simulator) || os(macOS)
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        proc.arguments = ["-o", zipURL.path, "-d", destDir.path]
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        proc.arguments = ["-xk", zipURL.path, destDir.path]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
         try proc.run()
         proc.waitUntilExit()
         #else
-        // iOS: Use FileManager's built-in support via NSFileCoordinator
-        // or fall back to a manual approach
-        //
-        // The trick: rename .zip and use UIDocument to extract,
-        // or use the simpler approach of spawning a background task
-        //
-        // Simplest iOS approach: use `Process` equivalent isn't available,
-        // so we use Apple's Compression framework directly
-        try decompressZip(from: zipURL, to: destDir)
+        // On-device: use Foundation's built-in ZIP reading
+        // ZIP files are just PKZip format — read central directory and extract
+        try extractZipNative(from: zipURL, to: destDir)
         #endif
     }
 
-    #if os(iOS)
-    private func decompressZip(from zipURL: URL, to destDir: URL) throws {
-        // Read ZIP file using Foundation (minimal implementation for flat ZIPs)
-        // For production, consider adding ZIPFoundation SPM package
-        //
-        // iOS 16+ supports reading ZIP archives via FileWrapper
-        let wrapper = try FileWrapper(url: zipURL, options: .immediate)
-        if let children = wrapper.fileWrappers {
-            for (name, child) in children {
-                let destURL = destDir.appendingPathComponent(name)
-                try child.write(to: destURL, options: .atomic, originalContentsURL: nil)
+    #if !targetEnvironment(simulator) && !os(macOS)
+    private func extractZipNative(from zipURL: URL, to destDir: URL) throws {
+        // Use Apple's Archive framework for ZIP extraction (iOS 16+)
+        // Fallback: manual ZIP parsing
+        let data = try Data(contentsOf: zipURL)
+
+        // Find End of Central Directory record
+        guard data.count > 22 else { throw DownloadError.extractionFailed }
+
+        var eocdOffset = data.count - 22
+        while eocdOffset >= 0 {
+            if data[eocdOffset] == 0x50 && data[eocdOffset+1] == 0x4B &&
+               data[eocdOffset+2] == 0x05 && data[eocdOffset+3] == 0x06 {
+                break
             }
-        } else if let data = wrapper.regularFileContents {
-            // Single file
-            let destURL = destDir.appendingPathComponent(zipURL.lastPathComponent)
-            try data.write(to: destURL)
+            eocdOffset -= 1
+        }
+        guard eocdOffset >= 0 else { throw DownloadError.extractionFailed }
+
+        // Parse central directory
+        let cdOffset = Int(data[eocdOffset+16..<eocdOffset+20].withUnsafeBytes { $0.load(as: UInt32.self) })
+        let cdCount = Int(data[eocdOffset+10..<eocdOffset+12].withUnsafeBytes { $0.load(as: UInt16.self) })
+
+        var pos = cdOffset
+        for _ in 0..<cdCount {
+            guard data[pos] == 0x50, data[pos+1] == 0x4B, data[pos+2] == 0x01, data[pos+3] == 0x02 else { break }
+
+            let method = Int(data[pos+10..<pos+12].withUnsafeBytes { $0.load(as: UInt16.self) })
+            let compSize = Int(data[pos+20..<pos+24].withUnsafeBytes { $0.load(as: UInt32.self) })
+            let uncompSize = Int(data[pos+24..<pos+28].withUnsafeBytes { $0.load(as: UInt32.self) })
+            let nameLen = Int(data[pos+28..<pos+30].withUnsafeBytes { $0.load(as: UInt16.self) })
+            let extraLen = Int(data[pos+30..<pos+32].withUnsafeBytes { $0.load(as: UInt16.self) })
+            let commentLen = Int(data[pos+32..<pos+34].withUnsafeBytes { $0.load(as: UInt16.self) })
+            let localOffset = Int(data[pos+42..<pos+46].withUnsafeBytes { $0.load(as: UInt32.self) })
+
+            let nameData = data[pos+46..<pos+46+nameLen]
+            let name = String(data: nameData, encoding: .utf8) ?? ""
+
+            let destPath = destDir.appendingPathComponent(name)
+
+            if name.hasSuffix("/") {
+                try fileManager.createDirectory(at: destPath, withIntermediateDirectories: true)
+            } else {
+                try fileManager.createDirectory(at: destPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+                // Read local file header to find data offset
+                let localNameLen = Int(data[localOffset+26..<localOffset+28].withUnsafeBytes { $0.load(as: UInt16.self) })
+                let localExtraLen = Int(data[localOffset+28..<localOffset+30].withUnsafeBytes { $0.load(as: UInt16.self) })
+                let dataStart = localOffset + 30 + localNameLen + localExtraLen
+
+                if method == 0 {
+                    // Stored (no compression)
+                    let fileData = data[dataStart..<dataStart+uncompSize]
+                    try Data(fileData).write(to: destPath)
+                } else {
+                    // Compressed — for our models, we use zip -0 (stored), so this shouldn't happen
+                    throw DownloadError.extractionFailed
+                }
+            }
+
+            pos += 46 + nameLen + extraLen + commentLen
         }
     }
     #endif
 }
 
-// MARK: - Progress Tracker
-
 private final class ProgressTracker: NSObject, URLSessionDownloadDelegate {
     let onProgress: (Double) -> Void
     init(onProgress: @escaping (Double) -> Void) { self.onProgress = onProgress }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {}
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
-                    totalBytesExpectedToWrite: Int64) {
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {}
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard totalBytesExpectedToWrite > 0 else { return }
         onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
     }
 }
 
 enum DownloadError: LocalizedError {
-    case invalidURL
-    case extractionFailed
+    case invalidURL, extractionFailed
     var errorDescription: String? {
         switch self {
         case .invalidURL: return "Invalid download URL"

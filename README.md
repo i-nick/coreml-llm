@@ -2,16 +2,16 @@
 
 Run LLMs on Apple devices with CoreML, optimized for Apple Neural Engine + GPU.
 
-Convert HuggingFace models to CoreML with one command, run inference on-device with stateful KV cache.
+Text generation and **multimodal image understanding**, entirely on-device.
 
 ## Supported Models
 
-| Model | Parameters | Size (int4) | Verified |
-|-------|-----------|-------------|----------|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | 0.5B | 302 MB | HF-exact match |
-| [Gemma 4 E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 2B | 2.4 GB | HF-exact match |
-| Qwen2.5-1.5B-Instruct | 1.5B | — | Planned |
-| Qwen3-0.6B | 0.6B | — | Planned |
+| Model | Parameters | Size (int4) | Multimodal | Verified |
+|-------|-----------|-------------|------------|----------|
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | 0.5B | 302 MB | Text only | HF-exact match |
+| [Gemma 4 E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 2B | 2.4 GB + 322 MB vision | **Image + Text** | HF-exact match |
+| Qwen2.5-1.5B-Instruct | 1.5B | — | Text only | Planned |
+| Qwen3-0.6B | 0.6B | — | Text only | Planned |
 
 ## Quick Start
 
@@ -54,18 +54,26 @@ print(out['token_id'])  # Next token prediction
 
 ### 3. iOS App
 
-Open `Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj` in Xcode, build to device (iOS 18+), and load the converted model folder.
+```bash
+open Examples/CoreMLLLMChat/Package.swift
+```
+
+Build to device (iOS 18+) → "Get Model" → Download → Chat.
+
+For multimodal: place `vision.mlpackage` alongside `model.mlpackage` → tap 📷 to attach images.
 
 ## How It Works
 
 ```
-HuggingFace Model          CoreML (.mlpackage)              iPhone/Mac
-┌──────────────┐          ┌──────────────────┐          ┌──────────────┐
-│  PyTorch     │  trace   │  Monolithic      │  predict │  ANE + GPU   │
-│  Weights     │ ──────── │  Model with      │ ──────── │  Inference   │
-│              │ convert  │  Stateful KV     │  MLState │  with KV     │
-│  config.json │ quantize │  Cache (int4)    │          │  Cache       │
-└──────────────┘          └──────────────────┘          └──────────────┘
+                         CoreML Models                    iPhone/Mac
+                    ┌─────────────────────┐
+  Image ──────────► │  Vision Encoder     │──► Image Features
+                    │  (322 MB)           │         │
+                    └─────────────────────┘         │
+                    ┌─────────────────────┐         ▼
+  Text  ──────────► │  Decoder + KV Cache │──► Token Predictions
+                    │  (302 MB - 2.4 GB)  │    (streaming)
+                    └─────────────────────┘
 ```
 
 ### ANE Optimizations
