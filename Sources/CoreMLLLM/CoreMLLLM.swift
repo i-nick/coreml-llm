@@ -87,7 +87,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// - Returns: Generated text
     public func generate(_ prompt: String, image: CGImage? = nil, maxTokens: Int = 256) async throws -> String {
         var result = ""
-        for await token in try stream(prompt, image: image, maxTokens: maxTokens) {
+        for await token in try await stream(prompt, image: image, maxTokens: maxTokens) {
             result += token
         }
         return result
@@ -105,15 +105,24 @@ public final class CoreMLLLM: @unchecked Sendable {
         let tokenIDs = tokenizer.encode(text: chatPrompt)
 
         // Process image if provided
-        var imageFeatures: MLMultiArray?
-        if let image, let vm = visionModel {
-            imageFeatures = try ImageProcessor.process(image, with: vm)
+        let imageFeatures: MLMultiArray? = if let image, let vm = visionModel {
+            try ImageProcessor.process(image, with: vm)
+        } else {
+            nil
         }
 
         reset()
 
+        // Capture everything before entering the async context
+        let mutableSelf = self
+        let features = imageFeatures
+        let tokens = tokenIDs
+
         return AsyncStream { continuation in
             Task {
+                let unsafeSelf = mutableSelf
+                let capturedFeatures = features
+                let capturedTokenIDs = tokens
                 do {
                     // Prefill
                     let IMAGE_TOKEN_ID = 258880
@@ -121,15 +130,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                     var imageIdx = 0
                     var nextID = 0
 
-                    for (step, tid) in tokenIDs.enumerated() {
-                        if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
-                            let imgEmb = ImageProcessor.sliceFeature(feats, at: imageIdx, hiddenSize: self.config.hiddenSize)
-                            nextID = try self.predict(tokenID: PAD_ID, position: step, imageEmbedding: imgEmb)
+                    for (step, tid) in capturedTokenIDs.enumerated() {
+                        if tid == IMAGE_TOKEN_ID, let feats = capturedFeatures, imageIdx < 256 {
+                            let imgEmb = ImageProcessor.sliceFeature(feats, at: imageIdx, hiddenSize: unsafeSelf.config.hiddenSize)
+                            nextID = try unsafeSelf.predict(tokenID: PAD_ID, position: step, imageEmbedding: imgEmb)
                             imageIdx += 1
                         } else {
-                            nextID = try self.predict(tokenID: tid, position: step)
+                            nextID = try unsafeSelf.predict(tokenID: tid, position: step)
                         }
-                        self.currentPosition = step + 1
+                        unsafeSelf.currentPosition = step + 1
                     }
 
                     // Decode
@@ -137,11 +146,11 @@ public final class CoreMLLLM: @unchecked Sendable {
                     for _ in 0..<maxTokens {
                         if eosIDs.contains(nextID) { break }
 
-                        let text = self.tokenizer.decode(tokens: [nextID])
+                        let text = unsafeSelf.tokenizer.decode(tokens: [nextID])
                         continuation.yield(text)
 
-                        nextID = try self.predict(tokenID: nextID, position: self.currentPosition)
-                        self.currentPosition += 1
+                        nextID = try unsafeSelf.predict(tokenID: nextID, position: unsafeSelf.currentPosition)
+                        unsafeSelf.currentPosition += 1
                     }
                 } catch {}
                 continuation.finish()
@@ -184,11 +193,13 @@ public final class CoreMLLLM: @unchecked Sendable {
         ]
 
         // Image embedding (zeros for text, vision features for image tokens)
-        let imgEmb = imageEmbedding ?? (try {
-            let arr = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
-            memset(arr.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
-            return arr
-        }())
+        let imgEmb: MLMultiArray
+        if let imageEmbedding {
+            imgEmb = imageEmbedding
+        } else {
+            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
+            memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
+        }
         dict["image_embedding"] = MLFeatureValue(multiArray: imgEmb)
 
         let output = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: dict), using: state)

@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
@@ -18,7 +18,8 @@ let package = Package(
             name: "CoreMLLLM",
             dependencies: [
                 .product(name: "Transformers", package: "swift-transformers"),
-            ]
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )
