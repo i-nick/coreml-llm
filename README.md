@@ -1,17 +1,26 @@
 # CoreML-LLM
 
-Run LLMs on Apple devices with CoreML, optimized for Apple Neural Engine + GPU.
+**On-device multimodal AI** for Apple devices — text and image understanding powered by CoreML with Apple Neural Engine + GPU optimization.
 
-Text generation and **multimodal image understanding**, entirely on-device.
+Run **Gemma 4** vision-language model entirely on iPhone: point your camera at anything, ask questions about it, get answers — no server, no internet required.
 
-## Supported Models
+<!-- TODO: Add demo GIF/video here after device testing -->
 
-| Model | Parameters | Size (int4) | Multimodal | Verified |
-|-------|-----------|-------------|------------|----------|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | 0.5B | 302 MB | Text only | HF-exact match |
-| [Gemma 4 E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 2B | 2.4 GB + 322 MB vision | **Image + Text** | HF-exact match |
-| Qwen2.5-1.5B-Instruct | 1.5B | — | Text only | Planned |
-| Qwen3-0.6B | 0.6B | — | Text only | Planned |
+## Pre-converted Models (Download & Run)
+
+| Model | Size | Multimodal | Download |
+|-------|------|------------|----------|
+| **Gemma 4 E2B** | 2.7 GB | **Image + Text** | [HuggingFace](https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml) |
+| Qwen2.5-0.5B | 302 MB | Text only | [HuggingFace](https://huggingface.co/mlboydaisuke/qwen2.5-0.5b-coreml) |
+
+The iOS app downloads these automatically. Or convert your own from any HuggingFace model.
+
+### Verified Results
+
+| Prompt | Gemma 4 E2B | Qwen2.5 0.5B |
+|--------|-------------|--------------|
+| "What is the capital of France?" | "The capital of France is **Paris**." ✅ | "The capital of France is Paris." ✅ |
+| 🖼️ Red square on white background | "**solid red square** with a white background" ✅ | — |
 
 ## Quick Start
 

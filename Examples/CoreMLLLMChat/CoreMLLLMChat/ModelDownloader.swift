@@ -22,8 +22,15 @@ final class ModelDownloader {
 
         static let defaults: [ModelInfo] = [
             ModelInfo(
+                id: "gemma4-e2b",
+                name: "Gemma 4 E2B (Multimodal)",
+                size: "2.7 GB",
+                downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+                folderName: "gemma4-e2b"
+            ),
+            ModelInfo(
                 id: "qwen2.5-0.5b",
-                name: "Qwen2.5 0.5B",
+                name: "Qwen2.5 0.5B (Text)",
                 size: "309 MB",
                 downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
                 folderName: "qwen2.5-0.5b"
@@ -49,18 +56,23 @@ final class ModelDownloader {
         status = "Downloading \(model.name)..."
         defer { isDownloading = false }
 
-        guard let url = URL(string: model.downloadURL) else {
-            throw DownloadError.invalidURL
-        }
-
-        let tempZip = try await downloadFile(url)
-
-        status = "Extracting..."
         let destDir = modelsDirectory.appendingPathComponent(model.folderName)
         try? fileManager.removeItem(at: destDir)
         try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
-        try unzipFile(tempZip, to: destDir)
-        try? fileManager.removeItem(at: tempZip)
+
+        if model.downloadURL.contains("huggingface.co") {
+            // HuggingFace: download individual files
+            try await downloadFromHuggingFace(model, to: destDir)
+        } else {
+            // GitHub Releases: download ZIP
+            guard let url = URL(string: model.downloadURL) else {
+                throw DownloadError.invalidURL
+            }
+            let tempZip = try await downloadFile(url)
+            status = "Extracting..."
+            try unzipFile(tempZip, to: destDir)
+            try? fileManager.removeItem(at: tempZip)
+        }
 
         guard let result = localModelURL(for: model) else {
             throw DownloadError.extractionFailed
@@ -69,6 +81,40 @@ final class ModelDownloader {
         status = "Ready"
         progress = 1.0
         return result
+    }
+
+    private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
+        let base = model.downloadURL
+        let files: [(String, String)] = [
+            ("model.mlpackage/Manifest.json", "model.mlpackage/Manifest.json"),
+            ("model.mlpackage/Data/com.apple.CoreML/model.mlmodel", "model.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
+            ("model.mlpackage/Data/com.apple.CoreML/weights/weight.bin", "model.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
+            ("model_config.json", "model_config.json"),
+            ("hf_model/tokenizer.json", "hf_model/tokenizer.json"),
+        ]
+
+        // Add vision files for multimodal models
+        let visionFiles: [(String, String)] = model.id.contains("gemma") ? [
+            ("vision.mlpackage/Manifest.json", "vision.mlpackage/Manifest.json"),
+            ("vision.mlpackage/Data/com.apple.CoreML/model.mlmodel", "vision.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
+            ("vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin", "vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
+        ] : []
+
+        let allFiles = files + visionFiles
+        for (i, (remotePath, localPath)) in allFiles.enumerated() {
+            let fileName = (localPath as NSString).lastPathComponent
+            status = "Downloading \(fileName)... (\(i+1)/\(allFiles.count))"
+
+            guard let url = URL(string: "\(base)/\(remotePath)") else { continue }
+            let destFile = destDir.appendingPathComponent(localPath)
+            try fileManager.createDirectory(at: destFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            let tempFile = try await downloadFile(url)
+            try? fileManager.removeItem(at: destFile)
+            try fileManager.moveItem(at: tempFile, to: destFile)
+
+            progress = Double(i + 1) / Double(allFiles.count)
+        }
     }
 
     func delete(_ model: ModelInfo) throws {
