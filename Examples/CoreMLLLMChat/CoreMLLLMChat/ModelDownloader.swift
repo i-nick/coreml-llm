@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-/// Downloads and caches CoreML models with background download support.
+/// Downloads and caches CoreML models with resume support.
 @Observable
 final class ModelDownloader: NSObject {
     var isDownloading = false
@@ -12,9 +12,10 @@ final class ModelDownloader: NSObject {
     var availableModels: [ModelInfo] = ModelInfo.defaults
 
     private let fileManager = FileManager.default
-    private var backgroundSession: URLSession!
+    private var session: URLSession!
     private var downloadContinuation: CheckedContinuation<URL, Error>?
-    private var currentFileProgress: (completed: Int, total: Int) = (0, 1)
+    private var totalBytesForAllFiles: Int64 = 0
+    private var completedBytesForPreviousFiles: Int64 = 0
 
     struct ModelInfo: Identifiable {
         let id: String
@@ -24,55 +25,46 @@ final class ModelDownloader: NSObject {
         let folderName: String
 
         static let defaults: [ModelInfo] = [
-            ModelInfo(
-                id: "gemma4-e2b",
-                name: "Gemma 4 E2B (Multimodal)",
-                size: "2.7 GB",
-                downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
-                folderName: "gemma4-e2b"
-            ),
-            ModelInfo(
-                id: "qwen2.5-0.5b",
-                name: "Qwen2.5 0.5B (Text)",
-                size: "309 MB",
-                downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
-                folderName: "qwen2.5-0.5b"
-            ),
+            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B (Multimodal)", size: "2.7 GB",
+                      downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+                      folderName: "gemma4-e2b"),
+            ModelInfo(id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
+                      downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
+                      folderName: "qwen2.5-0.5b"),
         ]
+    }
+
+    // File list with estimated sizes for progress weighting
+    private struct DownloadFile {
+        let remotePath: String
+        let localPath: String
+        let estimatedSize: Int64  // bytes
     }
 
     override init() {
         super.init()
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 3600  // 1 hour for large files
-        backgroundSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        config.timeoutIntervalForResource = 7200
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
-    func isDownloaded(_ model: ModelInfo) -> Bool {
-        localModelURL(for: model) != nil
-    }
+    func isDownloaded(_ model: ModelInfo) -> Bool { localModelURL(for: model) != nil }
 
-    /// Check if any files exist (including partial downloads).
     func hasFiles(_ model: ModelInfo) -> Bool {
-        let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        return fileManager.fileExists(atPath: dir.path)
+        fileManager.fileExists(atPath: modelsDirectory.appendingPathComponent(model.folderName).path)
     }
 
     func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        // Check pre-compiled .mlmodelc first
+        // .mlmodelc
         let modelc = dir.appendingPathComponent("model.mlmodelc")
-        let weightC = dir.appendingPathComponent("model.mlmodelc/weights/weight.bin")
-        if fileManager.fileExists(atPath: modelc.path),
-           fileManager.fileExists(atPath: weightC.path) {
+        if fileManager.fileExists(atPath: modelc.appendingPathComponent("weights/weight.bin").path) {
             return modelc
         }
-        // Fallback to .mlpackage
+        // .mlpackage
         let pkg = dir.appendingPathComponent("model.mlpackage")
-        let weightP = dir.appendingPathComponent("model.mlpackage/Data/com.apple.CoreML/weights/weight.bin")
-        if fileManager.fileExists(atPath: pkg.path),
-           fileManager.fileExists(atPath: weightP.path) {
+        if fileManager.fileExists(atPath: pkg.appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin").path) {
             return pkg
         }
         return nil
@@ -83,9 +75,8 @@ final class ModelDownloader: NSObject {
 
         isDownloading = true
         progress = 0
-        status = "Downloading \(model.name)..."
+        status = "Starting..."
 
-        // Keep app alive during download
         #if os(iOS)
         var bgTask: UIBackgroundTaskIdentifier = .invalid
         bgTask = UIApplication.shared.beginBackgroundTask {
@@ -97,33 +88,27 @@ final class ModelDownloader: NSObject {
         defer {
             isDownloading = false
             #if os(iOS)
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-            }
+            if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
             #endif
         }
 
-        // Clean up any partial download
         let destDir = modelsDirectory.appendingPathComponent(model.folderName)
-        try? fileManager.removeItem(at: destDir)
         try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
 
         if model.downloadURL.contains("huggingface.co") {
             try await downloadFromHuggingFace(model, to: destDir)
         } else {
-            guard let url = URL(string: model.downloadURL) else {
-                throw DownloadError.invalidURL
-            }
+            // Clean start for ZIP
+            try? fileManager.removeItem(at: destDir)
+            try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
+            guard let url = URL(string: model.downloadURL) else { throw DownloadError.invalidURL }
             let tempZip = try await downloadSingleFile(url)
             status = "Extracting..."
             try unzipFile(tempZip, to: destDir)
             try? fileManager.removeItem(at: tempZip)
         }
 
-        guard let result = localModelURL(for: model) else {
-            throw DownloadError.extractionFailed
-        }
-
+        guard let result = localModelURL(for: model) else { throw DownloadError.extractionFailed }
         status = "Ready"
         progress = 1.0
         return result
@@ -131,61 +116,73 @@ final class ModelDownloader: NSObject {
 
     func delete(_ model: ModelInfo) throws {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        if fileManager.fileExists(atPath: dir.path) {
-            try fileManager.removeItem(at: dir)
-        }
+        if fileManager.fileExists(atPath: dir.path) { try fileManager.removeItem(at: dir) }
     }
 
-    // MARK: - HuggingFace Download
+    // MARK: - HuggingFace Download with Resume
 
     private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
         let base = model.downloadURL
-        // Use pre-compiled .mlmodelc (no on-device compilation needed)
-        var files: [(String, String)] = [
-            ("model.mlmodelc/coremldata.bin", "model.mlmodelc/coremldata.bin"),
-            ("model.mlmodelc/model.mil", "model.mlmodelc/model.mil"),
-            ("model.mlmodelc/metadata.json", "model.mlmodelc/metadata.json"),
-            ("model.mlmodelc/analytics/coremldata.bin", "model.mlmodelc/analytics/coremldata.bin"),
-            ("model.mlmodelc/weights/weight.bin", "model.mlmodelc/weights/weight.bin"),
-            ("model_config.json", "model_config.json"),
-            ("hf_model/tokenizer.json", "hf_model/tokenizer.json"),
+
+        var files: [DownloadFile] = [
+            .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
+            .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
+            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
         ]
 
         if model.id.contains("gemma") {
             files += [
-                ("vision.mlmodelc/coremldata.bin", "vision.mlmodelc/coremldata.bin"),
-                ("vision.mlmodelc/model.mil", "vision.mlmodelc/model.mil"),
-                ("vision.mlmodelc/metadata.json", "vision.mlmodelc/metadata.json"),
-                ("vision.mlmodelc/analytics/coremldata.bin", "vision.mlmodelc/analytics/coremldata.bin"),
-                ("vision.mlmodelc/weights/weight.bin", "vision.mlmodelc/weights/weight.bin"),
+                .init(remotePath: "vision.mlmodelc/weights/weight.bin", localPath: "vision.mlmodelc/weights/weight.bin", estimatedSize: 320_000_000),
+                .init(remotePath: "vision.mlmodelc/coremldata.bin", localPath: "vision.mlmodelc/coremldata.bin", estimatedSize: 200_000),
+                .init(remotePath: "vision.mlmodelc/model.mil", localPath: "vision.mlmodelc/model.mil", estimatedSize: 50_000),
+                .init(remotePath: "vision.mlmodelc/metadata.json", localPath: "vision.mlmodelc/metadata.json", estimatedSize: 1_000),
+                .init(remotePath: "vision.mlmodelc/analytics/coremldata.bin", localPath: "vision.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
             ]
         }
 
-        currentFileProgress = (0, files.count)
+        totalBytesForAllFiles = files.reduce(0) { $0 + $1.estimatedSize }
+        completedBytesForPreviousFiles = 0
 
-        for (i, (remotePath, localPath)) in files.enumerated() {
-            let fileName = (localPath as NSString).lastPathComponent
-            status = "Downloading \(fileName) (\(i+1)/\(files.count))..."
-            currentFileProgress = (i, files.count)
+        for file in files {
+            let destFile = destDir.appendingPathComponent(file.localPath)
 
-            guard let url = URL(string: "\(base)/\(remotePath)") else { continue }
-            let destFile = destDir.appendingPathComponent(localPath)
+            // Resume: skip if file already exists with correct size
+            if fileManager.fileExists(atPath: destFile.path) {
+                let attrs = try? fileManager.attributesOfItem(atPath: destFile.path)
+                let existingSize = attrs?[.size] as? Int64 ?? 0
+                if existingSize > 0 {
+                    completedBytesForPreviousFiles += existingSize
+                    progress = Double(completedBytesForPreviousFiles) / Double(totalBytesForAllFiles)
+                    continue  // Already downloaded
+                }
+            }
+
+            let fileName = (file.localPath as NSString).lastPathComponent
+            status = "Downloading \(fileName)..."
+
+            guard let url = URL(string: "\(base)/\(file.remotePath)") else { continue }
             try fileManager.createDirectory(at: destFile.deletingLastPathComponent(), withIntermediateDirectories: true)
 
             let tempFile = try await downloadSingleFile(url)
             try? fileManager.removeItem(at: destFile)
             try fileManager.moveItem(at: tempFile, to: destFile)
 
-            progress = Double(i + 1) / Double(files.count)
+            let downloadedSize = (try? fileManager.attributesOfItem(atPath: destFile.path))?[.size] as? Int64 ?? file.estimatedSize
+            completedBytesForPreviousFiles += downloadedSize
+            progress = Double(completedBytesForPreviousFiles) / Double(totalBytesForAllFiles)
         }
     }
 
-    // MARK: - Background Download
+    // MARK: - Single File Download
 
     private func downloadSingleFile(_ url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             self.downloadContinuation = continuation
-            let task = backgroundSession.downloadTask(with: url)
+            let task = session.downloadTask(with: url)
             task.resume()
         }
     }
@@ -210,7 +207,6 @@ final class ModelDownloader: NSObject {
     private func extractZipNative(from zipURL: URL, to destDir: URL) throws {
         let data = try Data(contentsOf: zipURL)
         guard data.count > 22 else { throw DownloadError.extractionFailed }
-
         var eocdOffset = data.count - 22
         while eocdOffset >= 0 {
             if data[eocdOffset] == 0x50 && data[eocdOffset+1] == 0x4B &&
@@ -218,10 +214,8 @@ final class ModelDownloader: NSObject {
             eocdOffset -= 1
         }
         guard eocdOffset >= 0 else { throw DownloadError.extractionFailed }
-
         let cdOffset = Int(data[eocdOffset+16..<eocdOffset+20].withUnsafeBytes { $0.load(as: UInt32.self) })
         let cdCount = Int(data[eocdOffset+10..<eocdOffset+12].withUnsafeBytes { $0.load(as: UInt16.self) })
-
         var pos = cdOffset
         for _ in 0..<cdCount {
             guard data[pos] == 0x50, data[pos+1] == 0x4B else { break }
@@ -232,15 +226,14 @@ final class ModelDownloader: NSObject {
             let localOffset = Int(data[pos+42..<pos+46].withUnsafeBytes { $0.load(as: UInt32.self) })
             let name = String(data: data[pos+46..<pos+46+nameLen], encoding: .utf8) ?? ""
             let destPath = destDir.appendingPathComponent(name)
-
             if name.hasSuffix("/") {
                 try fileManager.createDirectory(at: destPath, withIntermediateDirectories: true)
             } else {
                 try fileManager.createDirectory(at: destPath.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let localNameLen = Int(data[localOffset+26..<localOffset+28].withUnsafeBytes { $0.load(as: UInt16.self) })
-                let localExtraLen = Int(data[localOffset+28..<localOffset+30].withUnsafeBytes { $0.load(as: UInt16.self) })
-                let dataStart = localOffset + 30 + localNameLen + localExtraLen
-                try Data(data[dataStart..<dataStart+uncompSize]).write(to: destPath)
+                let lnl = Int(data[localOffset+26..<localOffset+28].withUnsafeBytes { $0.load(as: UInt16.self) })
+                let lel = Int(data[localOffset+28..<localOffset+30].withUnsafeBytes { $0.load(as: UInt16.self) })
+                let ds = localOffset + 30 + lnl + lel
+                try Data(data[ds..<ds+uncompSize]).write(to: destPath)
             }
             pos += 46 + nameLen + extraLen + commentLen
         }
@@ -248,12 +241,11 @@ final class ModelDownloader: NSObject {
     #endif
 
     private var modelsDirectory: URL {
-        let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("Models")
+        fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("Models")
     }
 }
 
-// MARK: - URLSession Delegate (Background Download)
+// MARK: - URLSession Delegate
 
 extension ModelDownloader: URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
@@ -271,15 +263,15 @@ extension ModelDownloader: URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
-        guard totalBytesExpectedToWrite > 0 else { return }
-        let fileProgress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-        let (completed, total) = currentFileProgress
-        let overallProgress = (Double(completed) + fileProgress) / Double(total)
-        let mbDone = Double(totalBytesWritten) / 1_000_000
-        let mbTotal = Double(totalBytesExpectedToWrite) / 1_000_000
+        let currentTotal = completedBytesForPreviousFiles + totalBytesWritten
+        let overallProgress = Double(currentTotal) / Double(max(totalBytesForAllFiles, 1))
+
+        let mbDone = Double(currentTotal) / 1_000_000
+        let mbTotal = Double(totalBytesForAllFiles) / 1_000_000
+
         Task { @MainActor in
-            self.progress = overallProgress
-            self.status = String(format: "%.0f / %.0f MB (%d/%d)", mbDone, mbTotal, completed + 1, total)
+            self.progress = min(overallProgress, 0.99)
+            self.status = String(format: "%.0f / %.0f MB", mbDone, mbTotal)
         }
     }
 
