@@ -61,7 +61,35 @@ out = model.predict({
 print(out['token_id'])  # Next token prediction
 ```
 
-### 3. iOS App
+### 3. Swift Package (for developers)
+
+Add to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.1.0"),
+]
+```
+
+```swift
+import CoreMLLLM
+
+// Text generation
+let llm = try await CoreMLLLM.load(from: modelDirectory)
+let answer = try await llm.generate("What is the capital of France?")
+// → "The capital of France is **Paris**."
+
+// Image understanding (Gemma 4)
+let caption = try await llm.generate("Describe this image", image: cgImage)
+// → "A solid red square centered on a white background."
+
+// Streaming
+for await token in try await llm.stream("Tell me a story") {
+    print(token, terminator: "")
+}
+```
+
+### 4. iOS App
 
 ```bash
 open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj

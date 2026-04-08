@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
@@ -17,12 +17,8 @@ let package = Package(
         .target(
             name: "CoreMLLLM",
             dependencies: [
-                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
-        ),
-        .testTarget(
-            name: "CoreMLLLMTests",
-            dependencies: ["CoreMLLLM"]
         ),
     ]
 )
