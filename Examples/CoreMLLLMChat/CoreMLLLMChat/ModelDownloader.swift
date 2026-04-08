@@ -55,12 +55,21 @@ final class ModelDownloader: NSObject {
 
     func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
+        // Check pre-compiled .mlmodelc first
+        let modelc = dir.appendingPathComponent("model.mlmodelc")
+        let weightC = dir.appendingPathComponent("model.mlmodelc/weights/weight.bin")
+        if fileManager.fileExists(atPath: modelc.path),
+           fileManager.fileExists(atPath: weightC.path) {
+            return modelc
+        }
+        // Fallback to .mlpackage
         let pkg = dir.appendingPathComponent("model.mlpackage")
-        let weight = dir.appendingPathComponent("model.mlpackage/Data/com.apple.CoreML/weights/weight.bin")
-        // Only consider downloaded if weight.bin exists (prevents partial download issues)
-        guard fileManager.fileExists(atPath: pkg.path),
-              fileManager.fileExists(atPath: weight.path) else { return nil }
-        return pkg
+        let weightP = dir.appendingPathComponent("model.mlpackage/Data/com.apple.CoreML/weights/weight.bin")
+        if fileManager.fileExists(atPath: pkg.path),
+           fileManager.fileExists(atPath: weightP.path) {
+            return pkg
+        }
+        return nil
     }
 
     func download(_ model: ModelInfo) async throws -> URL {
@@ -125,19 +134,24 @@ final class ModelDownloader: NSObject {
 
     private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
         let base = model.downloadURL
+        // Use pre-compiled .mlmodelc (no on-device compilation needed)
         var files: [(String, String)] = [
-            ("model.mlpackage/Manifest.json", "model.mlpackage/Manifest.json"),
-            ("model.mlpackage/Data/com.apple.CoreML/model.mlmodel", "model.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
-            ("model.mlpackage/Data/com.apple.CoreML/weights/weight.bin", "model.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
+            ("model.mlmodelc/coremldata.bin", "model.mlmodelc/coremldata.bin"),
+            ("model.mlmodelc/model.mil", "model.mlmodelc/model.mil"),
+            ("model.mlmodelc/metadata.json", "model.mlmodelc/metadata.json"),
+            ("model.mlmodelc/analytics/coremldata.bin", "model.mlmodelc/analytics/coremldata.bin"),
+            ("model.mlmodelc/weights/weight.bin", "model.mlmodelc/weights/weight.bin"),
             ("model_config.json", "model_config.json"),
             ("hf_model/tokenizer.json", "hf_model/tokenizer.json"),
         ]
 
         if model.id.contains("gemma") {
             files += [
-                ("vision.mlpackage/Manifest.json", "vision.mlpackage/Manifest.json"),
-                ("vision.mlpackage/Data/com.apple.CoreML/model.mlmodel", "vision.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
-                ("vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin", "vision.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
+                ("vision.mlmodelc/coremldata.bin", "vision.mlmodelc/coremldata.bin"),
+                ("vision.mlmodelc/model.mil", "vision.mlmodelc/model.mil"),
+                ("vision.mlmodelc/metadata.json", "vision.mlmodelc/metadata.json"),
+                ("vision.mlmodelc/analytics/coremldata.bin", "vision.mlmodelc/analytics/coremldata.bin"),
+                ("vision.mlmodelc/weights/weight.bin", "vision.mlmodelc/weights/weight.bin"),
             ]
         }
 

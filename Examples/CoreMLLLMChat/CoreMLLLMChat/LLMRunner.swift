@@ -37,18 +37,31 @@ final class LLMRunner {
         }
 
         // Main model
-        loadingStatus = "Compiling model..."
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = .cpuAndNeuralEngine
-        let compiled = try await MLModel.compileModel(at: url)
-        model = try MLModel(contentsOf: compiled, configuration: mlConfig)
+
+        // Load main model (.mlmodelc = pre-compiled, .mlpackage = needs compile)
+        let modelcURL = folder.appendingPathComponent("model.mlmodelc")
+        if FileManager.default.fileExists(atPath: modelcURL.path) {
+            loadingStatus = "Loading model..."
+            model = try MLModel(contentsOf: modelcURL, configuration: mlConfig)
+        } else {
+            loadingStatus = "Compiling model..."
+            let compiled = try await MLModel.compileModel(at: url)
+            model = try MLModel(contentsOf: compiled, configuration: mlConfig)
+        }
         state = model?.makeState()
 
         // Vision model
-        let visionURL = folder.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionURL.path) {
+        let visionCompiledURL = folder.appendingPathComponent("vision.mlmodelc")
+        let visionPackageURL = folder.appendingPathComponent("vision.mlpackage")
+        if FileManager.default.fileExists(atPath: visionCompiledURL.path) {
+            loadingStatus = "Loading vision..."
+            visionModel = try MLModel(contentsOf: visionCompiledURL, configuration: mlConfig)
+            hasVision = true
+        } else if FileManager.default.fileExists(atPath: visionPackageURL.path) {
             loadingStatus = "Compiling vision..."
-            let compiledV = try await MLModel.compileModel(at: visionURL)
+            let compiledV = try await MLModel.compileModel(at: visionPackageURL)
             visionModel = try MLModel(contentsOf: compiledV, configuration: mlConfig)
             hasVision = true
         }
