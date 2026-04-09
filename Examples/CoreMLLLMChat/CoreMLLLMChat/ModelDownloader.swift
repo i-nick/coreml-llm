@@ -10,6 +10,7 @@ final class ModelDownloader: NSObject {
     var progress: Double = 0
     var status = ""
     var availableModels: [ModelInfo] = ModelInfo.defaults
+    var refreshTrigger = 0  // Increment to force UI refresh
 
     private let fileManager = FileManager.default
     private var session: URLSession!
@@ -125,6 +126,7 @@ final class ModelDownloader: NSObject {
     func delete(_ model: ModelInfo) throws {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         if fileManager.fileExists(atPath: dir.path) { try fileManager.removeItem(at: dir) }
+        refreshTrigger += 1
     }
 
     // MARK: - HuggingFace Download with Resume

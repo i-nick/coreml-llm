@@ -9,7 +9,8 @@ struct ModelPickerView: View {
             List {
                 Section("Available Models") {
                     ForEach(downloader.availableModels) { model in
-                        ModelRow(
+                        let _ = downloader.refreshTrigger  // Force re-evaluate on delete
+                    ModelRow(
                             model: model,
                             isDownloaded: downloader.isDownloaded(model),
                             hasFiles: downloader.hasFiles(model),
@@ -23,6 +24,7 @@ struct ModelPickerView: View {
                             },
                             onDelete: {
                                 try? downloader.delete(model)
+                                downloader.status = "Deleted \(model.name)"
                             }
                         )
                     }
