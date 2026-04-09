@@ -36,11 +36,21 @@ struct ChatView: View {
                     }
                 }
 
-                if runner.isGenerating {
-                    HStack {
-                        ProgressView().scaleEffect(0.8)
+                // tok/s stays visible after generation finishes so the
+                // final speed can still be read off the screen.
+                if runner.isLoaded && (runner.isGenerating || runner.tokensPerSecond > 0) {
+                    HStack(spacing: 6) {
+                        if runner.isGenerating {
+                            ProgressView().scaleEffect(0.8)
+                        }
                         Text(String(format: "%.1f tok/s", runner.tokensPerSecond))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        if !runner.isGenerating {
+                            Text("(last)")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                     .padding(.vertical, 4)
                 }
