@@ -74,7 +74,7 @@ final class LLMRunner {
         }
 
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = .cpuAndGPU
+        mlConfig.computeUnits = .all
 
         // Detect: chunked or monolithic?
         let chunk1URL = findModel(in: folder, name: "chunk1")
