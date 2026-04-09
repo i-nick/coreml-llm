@@ -26,8 +26,10 @@ final class LLMRunner {
     private var chunk2State: MLState?
     private var isChunked = false
 
-    // Vision
+    // Vision (lazy-loaded to save memory)
     private var visionModel: MLModel?
+    private var visionModelURL: URL?
+    private var visionConfig: MLModelConfiguration?
 
     // External embeddings (for chunked model without embedded vocab tables)
     private var embedTokens: EmbeddingLookup?
@@ -89,11 +91,11 @@ final class LLMRunner {
             try await loadMonolithic(url: url, folder: folder, config: mlConfig)
         }
 
-        // Vision model
-        if let vurl = findModel(in: folder, name: "vision") {
-            loadingStatus = "Loading vision..."
-            visionModel = try MLModel(contentsOf: vurl, configuration: mlConfig)
+        // Vision model: defer loading to save memory (loaded on first image)
+        if findModel(in: folder, name: "vision") != nil {
             hasVision = true
+            visionModelURL = findModel(in: folder, name: "vision")
+            visionConfig = mlConfig
         }
 
         // Tokenizer
@@ -158,13 +160,12 @@ final class LLMRunner {
             var f32 = [Float](repeating: 0, count: count)
             projData.withUnsafeBytes { raw in
                 let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
-                var f16Buf = [Float16](repeating: 0, count: count)
-                for i in 0..<count { f16Buf[i] = Float16(bitPattern: f16Ptr[i]) }
-                var f32Buf = [Float](repeating: 0, count: count)
-                vDSP.convertElements(of: f16Buf, to: &f32Buf)
-                f32 = f32Buf
+                for i in 0..<count {
+                    f32[i] = Float(Float16(bitPattern: f16Ptr[i]))
+                }
             }
             perLayerProjF32 = f32
+            perLayerProjWeight = nil  // Release mapped data, no longer needed
         }
 
         // RoPE tables (numpy .npy files → raw float16 data, skip 128-byte npy header)
@@ -197,8 +198,15 @@ final class LLMRunner {
         let tokenIDs = tokenizer!.encode(text: prompt)
 
         var imageFeatures: MLMultiArray?
-        if let image, let vm = visionModel {
-            imageFeatures = try processImage(image, with: vm)
+        if let image {
+            // Lazy-load vision model on first use
+            if visionModel == nil, let url = visionModelURL, let cfg = visionConfig {
+                loadingStatus = "Loading vision model..."
+                visionModel = try MLModel(contentsOf: url, configuration: cfg)
+            }
+            if let vm = visionModel {
+                imageFeatures = try processImage(image, with: vm)
+            }
         }
 
         resetConversation()
