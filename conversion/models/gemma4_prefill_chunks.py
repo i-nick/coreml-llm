@@ -168,6 +168,26 @@ def _run_layer_prefill(
     return hidden_states, K_new, V_new, kv_store_13_k, kv_store_13_v, kv_store_14_k, kv_store_14_v
 
 
+def _process_layers_prefill(layers, start, end, hidden_states, causal_mask, per_layer_combined,
+                              cos_s, sin_s, cos_f, sin_f, config,
+                              kv13_k, kv13_v, kv14_k, kv14_v):
+    """Run a range of layers in prefill mode. Returns hidden_states + K/V outputs + kv stores."""
+    K_outs = []
+    V_outs = []
+    for local_idx, layer in enumerate(layers):
+        layer_idx = start + local_idx
+        (hidden_states, K_new, V_new,
+         kv13_k, kv13_v, kv14_k, kv14_v) = _run_layer_prefill(
+            layer, layer_idx, hidden_states,
+            cos_s, sin_s, cos_f, sin_f, causal_mask,
+            config, per_layer_combined,
+            kv13_k, kv13_v, kv14_k, kv14_v,
+        )
+        K_outs.append(K_new)
+        V_outs.append(V_new)
+    return hidden_states, K_outs, V_outs, kv13_k, kv13_v, kv14_k, kv14_v
+
+
 class PrefillChunk1(nn.Module):
     """Layers 0-7 prefill. Computes PLE inside, outputs K/V per layer."""
     START, END = 0, 8
@@ -233,8 +253,93 @@ class PrefillChunk1(nn.Module):
 
         # K/V outputs: list of (1, num_kv_heads, N, hd) per layer
         # For sliding layers, hd=256; for full layers, hd=512
-        # Stack into separate sliding/full lists in export script
         return (hidden_states, per_layer_combined,
                 K_outs[0], V_outs[0], K_outs[1], V_outs[1], K_outs[2], V_outs[2],
                 K_outs[3], V_outs[3], K_outs[4], V_outs[4], K_outs[5], V_outs[5],
                 K_outs[6], V_outs[6], K_outs[7], V_outs[7])
+
+
+class PrefillChunk2(nn.Module):
+    """Layers 8-14 prefill. Outputs K/V for L8-L12 and kv13/kv14 for L13/L14
+    (which double as sliding/full KV sources for shared layers in chunks 3, 4)."""
+    START, END = 8, 15
+
+    def __init__(self, model: Gemma4Model):
+        super().__init__()
+        self.config = model.config
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+
+    def forward(self, hidden_states, causal_mask, per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f):
+        kv13_k = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv13_v = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv14_k = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+        kv14_v = torch.zeros(1, 1, 1, 1, dtype=MODEL_DTYPE)
+
+        hidden_states, K_outs, V_outs, kv13_k, kv13_v, kv14_k, kv14_v = _process_layers_prefill(
+            self.layers, self.START, self.END, hidden_states, causal_mask, per_layer_combined,
+            cos_s, sin_s, cos_f, sin_f, self.config,
+            kv13_k, kv13_v, kv14_k, kv14_v,
+        )
+
+        # K_outs[5] aliases L13's K (= kv13_k), K_outs[6] aliases L14's K (= kv14_k)
+        # Don't output those separately; use kv13/kv14 names
+        return (hidden_states,
+                K_outs[0], V_outs[0], K_outs[1], V_outs[1], K_outs[2], V_outs[2],
+                K_outs[3], V_outs[3], K_outs[4], V_outs[4],
+                kv13_k, kv13_v, kv14_k, kv14_v)
+
+
+class PrefillChunk3(nn.Module):
+    """Layers 15-24 prefill. KV-shared, reads kv13/kv14."""
+    START, END = 15, 25
+
+    def __init__(self, model: Gemma4Model):
+        super().__init__()
+        self.config = model.config
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+
+    def forward(self, hidden_states, causal_mask, per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
+        hidden_states, _, _, _, _, _, _ = _process_layers_prefill(
+            self.layers, self.START, self.END, hidden_states, causal_mask, per_layer_combined,
+            cos_s, sin_s, cos_f, sin_f, self.config,
+            kv13_k, kv13_v, kv14_k, kv14_v,
+        )
+        return hidden_states
+
+
+class PrefillChunk4(nn.Module):
+    """Layers 25-34 prefill + norm + lm_head. Outputs LAST token's id (last position)."""
+    START, END = 25, 35
+
+    def __init__(self, model: Gemma4Model):
+        super().__init__()
+        self.config = model.config
+        self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
+        self.norm = model.norm
+        self.lm_head = nn.Conv2d(model.lm_head.in_channels, model.lm_head.out_channels,
+                                  kernel_size=1, bias=False)
+        self.lm_head.weight.data = model.lm_head.weight.data.clone()
+        self.argmax = model.argmax
+        self.softcap = model.softcap
+
+    def forward(self, hidden_states, causal_mask, per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v,
+                last_position_mask):  # (1, N, 1) — 1 at real last position, 0 elsewhere
+        hidden_states, _, _, _, _, _, _ = _process_layers_prefill(
+            self.layers, self.START, self.END, hidden_states, causal_mask, per_layer_combined,
+            cos_s, sin_s, cos_f, sin_f, self.config,
+            kv13_k, kv13_v, kv14_k, kv14_v,
+        )
+        hidden_states = self.norm(hidden_states)  # (1, N, hidden)
+        # Select the real last token's hidden state via masked sum (ANE-friendly)
+        last = (hidden_states * last_position_mask).sum(dim=1, keepdim=True)  # (1, 1, hidden)
+        x = last.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+        logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)
+        if self.softcap > 0:
+            logits = torch.tanh(logits / self.softcap) * self.softcap
+        token_id, token_logit = self.argmax(logits.squeeze(0))
+        return token_id, token_logit
