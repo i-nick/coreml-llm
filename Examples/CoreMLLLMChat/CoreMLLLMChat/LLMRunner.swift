@@ -28,12 +28,23 @@ final class LLMRunner {
     // Vision
     private var visionModel: MLModel?
 
+    // External embeddings (for chunked model without embedded vocab tables)
+    private var embedTokens: EmbeddingLookup?
+    private var embedPerLayer: EmbeddingLookup?
+    private var perLayerProjWeight: Data?  // (8960, 1536) float16
+    private var perLayerNormWeight: Data?  // (256,) float32
+
     // Shared
     private var tokenizer: (any Tokenizer)?
     private var contextLength = 512
     private var hiddenSize = 1536
+    private var perLayerDim = 256
     private var architecture = "gemma4"
     private var currentPosition = 0
+    private var embedScale: Float = 39.19
+    private var perLayerProjScale: Float = 0.0255
+    private var perLayerInputScale: Float = 0.707
+    private var perLayerEmbedScale: Float = 16.0
 
     // MARK: - Loading
 
@@ -48,7 +59,12 @@ final class LLMRunner {
             contextLength = json["context_length"] as? Int ?? 512
             architecture = json["architecture"] as? String ?? "gemma4"
             hiddenSize = json["hidden_size"] as? Int ?? 1536
+            perLayerDim = json["per_layer_dim"] as? Int ?? 256
             modelName = json["model_name"] as? String ?? "Model"
+            if let es = json["embed_scale"] as? Double { embedScale = Float(es) }
+            if let ps = json["per_layer_model_projection_scale"] as? Double { perLayerProjScale = Float(ps) }
+            if let is_ = json["per_layer_input_scale"] as? Double { perLayerInputScale = Float(is_) }
+            if let es2 = json["per_layer_embed_scale"] as? Double { perLayerEmbedScale = Float(es2) }
         }
 
         let mlConfig = MLModelConfiguration()
@@ -95,17 +111,36 @@ final class LLMRunner {
         isChunked = false
     }
 
-    private func loadChunked(folder: URL, config: MLModelConfiguration) async throws {
+    private func loadChunked(folder: URL, config mlConfig: MLModelConfiguration) async throws {
         loadingStatus = "Loading chunk 1/3..."
-        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: config)
+        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
         chunk1State = chunk1?.makeState()
 
         loadingStatus = "Loading chunk 2/3..."
-        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: config)
+        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
         chunk2State = chunk2?.makeState()
 
         loadingStatus = "Loading chunk 3/3..."
-        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: config)
+        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
+
+        // Load external embeddings (memory-mapped)
+        loadingStatus = "Loading embeddings..."
+        let vocabSize = 262144
+        let nlayers = 35
+        let etURL = folder.appendingPathComponent("embed_tokens_q8.bin")
+        let etScalesURL = folder.appendingPathComponent("embed_tokens_scales.bin")
+        let eplURL = folder.appendingPathComponent("embed_tokens_per_layer_q8.bin")
+        let eplScalesURL = folder.appendingPathComponent("embed_tokens_per_layer_scales.bin")
+
+        if FileManager.default.fileExists(atPath: etURL.path) {
+            embedTokens = try EmbeddingLookup(dataURL: etURL, scalesURL: etScalesURL,
+                                               vocabSize: vocabSize, dim: hiddenSize, scale: embedScale)
+            embedPerLayer = try EmbeddingLookup(dataURL: eplURL, scalesURL: eplScalesURL,
+                                                 vocabSize: vocabSize, dim: nlayers * perLayerDim, scale: perLayerEmbedScale)
+        }
+
+        perLayerProjWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_projection.bin"), options: .mappedIfSafe)
+        perLayerNormWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_norm_weight.bin"), options: .mappedIfSafe)
 
         isChunked = true
     }
@@ -231,35 +266,37 @@ final class LLMRunner {
 
     private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
         guard let chunk1, let chunk2, let chunk3,
-              let chunk1State, let chunk2State else { throw NSError(domain: "", code: 0) }
+              let chunk1State, let chunk2State,
+              let embedTokens, let embedPerLayer else { throw NSError(domain: "", code: 0) }
         let ctx = contextLength, hs = hiddenSize
+        let nlayers = 35, pld = perLayerDim
 
-        let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
-        ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
         let pos = try MLMultiArray(shape: [1], dataType: .int32)
         pos[0] = NSNumber(value: Int32(position))
         let mask = try makeCausalMask(position: position, contextLength: ctx)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
-        let imgEmb: MLMultiArray
+        // Compute embeddings externally
+        let hiddenStatesIn: MLMultiArray
         if let imageEmbedding {
-            imgEmb = imageEmbedding
+            hiddenStatesIn = imageEmbedding
         } else {
-            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
-            memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
+            hiddenStatesIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hs)])
         }
 
-        // Chunk 1: embed + layers 0-11 → hidden_states + per_layer_combined
+        // Per-layer combined: raw + projection
+        let perLayerCombined = try computePerLayerCombined(tokenID: tokenID, embedding: hiddenStatesIn)
+
+        // Chunk 1: layers 0-11
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
-            "input_ids": MLFeatureValue(multiArray: ids),
+            "hidden_states": MLFeatureValue(multiArray: hiddenStatesIn),
+            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
             "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
-            "image_embedding": MLFeatureValue(multiArray: imgEmb),
         ])
         let out1 = try chunk1.prediction(from: input1, using: chunk1State)
-        let hiddenStates = out1.featureValue(for: "hidden_states")!.multiArrayValue!
-        let perLayerCombined = out1.featureValue(for: "per_layer_combined")!.multiArrayValue!
+        let hiddenStates = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
 
         // Chunk 2: layers 12-23 → hidden_states (+ stores kv13/kv14 internally)
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
@@ -311,6 +348,65 @@ final class LLMRunner {
         // For now, zero-fill (this will be fixed when chunk2 outputs KV)
         memset(result.dataPointer, 0, ctx * headDim * MemoryLayout<UInt16>.stride)
         return result
+    }
+
+    // MARK: - Per-Layer Computation
+
+    private func computePerLayerCombined(tokenID: Int, embedding: MLMultiArray) throws -> MLMultiArray {
+        guard let embedPerLayer, let perLayerProjWeight else {
+            throw NSError(domain: "LLMRunner", code: 2)
+        }
+        let nlayers = 35, pld = perLayerDim
+        let totalDim = nlayers * pld  // 8960
+        let result = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+        let resultPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: totalDim)
+
+        // Raw per-layer embedding
+        let raw = embedPerLayer.lookupRaw(tokenID)
+
+        // Projection: per_layer_model_projection(embedding) * scale
+        // projection weight: (8960, 1536) float16
+        let embPtr = embedding.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
+        let projPtr = perLayerProjWeight!.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt16.self) }
+
+        // Simple matmul: result = embedding @ projWeight^T * projScale
+        // For each output dim, dot product of embedding (1536) with weight row
+        for i in 0..<totalDim {
+            var sum: Float = 0
+            let rowStart = i * hiddenSize
+            for j in 0..<hiddenSize {
+                let e = float16ToFloat(embPtr[j])
+                let w = float16ToFloat(projPtr[rowStart + j])
+                sum += e * w
+            }
+            sum *= perLayerProjScale
+
+            // Combine: (proj + raw) * inputScale
+            let rawVal = float16ToFloat(raw[i])
+            let combined = (sum + rawVal) * perLayerInputScale
+            resultPtr[i] = floatToFloat16(combined)
+        }
+
+        return result
+    }
+
+    private func float16ToFloat(_ bits: UInt16) -> Float {
+        let sign: UInt32 = UInt32(bits >> 15) << 31
+        let exp = UInt32((bits >> 10) & 0x1F)
+        let frac = UInt32(bits & 0x3FF)
+        if exp == 0 { return exp == 0 && frac == 0 ? Float(bitPattern: sign) : 0 }
+        if exp == 31 { return Float.infinity }
+        return Float(bitPattern: sign | ((exp + 112) << 23) | (frac << 13))
+    }
+
+    private func floatToFloat16(_ value: Float) -> UInt16 {
+        let bits = value.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        let exp = Int((bits >> 23) & 0xFF) - 127 + 15
+        let frac = UInt16((bits >> 13) & 0x3FF)
+        if exp <= 0 { return sign }
+        if exp >= 31 { return sign | 0x7C00 }
+        return sign | UInt16(exp) << 10 | frac
     }
 
     // MARK: - Helpers
