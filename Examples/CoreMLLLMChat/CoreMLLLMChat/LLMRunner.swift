@@ -27,12 +27,14 @@ final class LLMRunner {
     private var chunk2State: MLState?  // unused
     private var isChunked = false
 
-    // Prefill chunks (seq=64 batch prefill; optional, decode-only if missing)
+    // Prefill chunks (seq=N batch prefill; optional, decode-only if missing).
+    // N=512 lets a single CoreML call cover multimodal prompts (~296 tokens:
+    // 280 image placeholders + ~16 text) and most text-only prompts.
     private var prefillChunk1: MLModel?
     private var prefillChunk2: MLModel?
     private var prefillChunk3: MLModel?
     private var prefillChunk4: MLModel?
-    private let prefillN = 64
+    private let prefillN = 512
     // SWA KV buffers: separate sliding (W=512) and full (ctx) per chunk
     private var kSliding1: MLMultiArray?  // (7, 1, W, max_hd)
     private var vSliding1: MLMultiArray?
