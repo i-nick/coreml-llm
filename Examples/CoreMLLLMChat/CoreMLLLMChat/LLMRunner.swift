@@ -380,22 +380,46 @@ final class LLMRunner {
                         return
                     }
 
-                    // Fast path: batched prefill (seq=N) when no image + prompt fits in one batch.
-                    // Single CoreML call replaces N per-token decode calls.
-                    let canPrefill = self.isChunked
-                        && imageFeatures == nil
+                    // Hybrid fast path: batched prefill (seq=N) for the first up to N
+                    // tokens, then per-token decode for any remaining prompt tokens.
+                    // Works for both text-only and mixed text+image batches — image
+                    // tokens at positions marked by IMAGE_TOKEN_ID are replaced with
+                    // vision encoder features on the fly.
+                    let havePrefill = self.isChunked
                         && self.prefillChunk1 != nil
                         && self.prefillChunk2 != nil
                         && self.prefillChunk3 != nil
                         && self.prefillChunk4 != nil
-                        && tokenIDs.count <= self.prefillN
-                        && tokenIDs.count > 0
-                    if canPrefill {
-                        self.loadingStatus = "Prefill (batch \(tokenIDs.count))..."
+                    let prefillLen = min(tokenIDs.count, self.prefillN)
+                    let useHybrid = havePrefill && prefillLen > 0
+
+                    if useHybrid {
+                        self.loadingStatus = "Prefill (batch \(prefillLen)/\(tokenIDs.count))..."
                         try autoreleasepool {
-                            nextID = try self.runPrefill(tokenIDs: tokenIDs)
+                            let batch = Array(tokenIDs[0..<prefillLen])
+                            nextID = try self.runPrefill(tokenIDs: batch, imageFeatures: imageFeatures)
                         }
-                        self.currentPosition = tokenIDs.count
+                        // Advance imageIdx by image tokens consumed in the prefill batch.
+                        imageIdx = tokenIDs[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
+                        self.currentPosition = prefillLen
+
+                        // Per-token decode for remaining prompt tokens (if any).
+                        if prefillLen < tokenIDs.count {
+                            for step in prefillLen..<tokenIDs.count {
+                                let tid = tokenIDs[step]
+                                try autoreleasepool {
+                                    if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
+                                        let imgEmb = self.sliceFeature(feats, at: imageIdx)
+                                        nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
+                                        imageIdx += 1
+                                    } else {
+                                        nextID = try self.predictStep(tokenID: tid, position: step)
+                                    }
+                                }
+                                self.currentPosition = step + 1
+                                self.loadingStatus = "Prefill \(step + 1)/\(tokenIDs.count)..."
+                            }
+                        }
                     } else {
                         for (step, tid) in tokenIDs.enumerated() {
                             try autoreleasepool {
@@ -701,7 +725,11 @@ final class LLMRunner {
     /// positions [0, realLen) into the persistent SWA decode caches. After this
     /// call, `currentPosition` should be set to `realLen` by the caller and decode
     /// continues from the returned token id.
-    private func runPrefill(tokenIDs: [Int]) throws -> Int {
+    ///
+    /// If `imageFeatures` is non-nil, tokens matching IMAGE_TOKEN_ID are replaced
+    /// with the corresponding vision encoder feature vector at the appropriate
+    /// position in the hidden_states batch.
+    private func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil) throws -> Int {
         guard let p1 = prefillChunk1, let p2 = prefillChunk2,
               let p3 = prefillChunk3, let p4 = prefillChunk4,
               let embedTokens,
@@ -726,7 +754,9 @@ final class LLMRunner {
         let tStart = CFAbsoluteTimeGetCurrent()
 
         // Build inputs common to all chunks.
-        let hiddenIn = try buildPrefillHiddenStates(tokenIDs: tokenIDs, N: N, embedTokens: embedTokens)
+        let hiddenIn = try buildPrefillHiddenStates(tokenIDs: tokenIDs, N: N,
+                                                     embedTokens: embedTokens,
+                                                     imageFeatures: imageFeatures)
         let plRaw = try buildPrefillPerLayerRaw(tokenIDs: tokenIDs, N: N)
         let causal = try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
@@ -850,15 +880,31 @@ final class LLMRunner {
     // MARK: - Prefill helpers
 
     /// Build (1, N, hidden) batched input: real token embeddings for [0, realLen),
-    /// zeros for the padding tail.
-    private func buildPrefillHiddenStates(tokenIDs: [Int], N: Int, embedTokens: EmbeddingLookup) throws -> MLMultiArray {
+    /// zeros for the padding tail. When imageFeatures is supplied, IMAGE_TOKEN_ID
+    /// occurrences are replaced in place with the vision encoder features.
+    private func buildPrefillHiddenStates(tokenIDs: [Int], N: Int,
+                                           embedTokens: EmbeddingLookup,
+                                           imageFeatures: MLMultiArray? = nil) throws -> MLMultiArray {
+        let IMAGE_TOKEN_ID = 258880
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hiddenSize)], dataType: .float16)
         memset(arr.dataPointer, 0, N * hiddenSize * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * hiddenSize)
+        let featPtr = imageFeatures?.dataPointer.bindMemory(
+            to: UInt16.self, capacity: imageFeatures!.count)
+        var imageIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            let emb = try embedTokens.lookup(tid, shape: [1, 1, NSNumber(value: hiddenSize)])
-            let src = emb.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
-            memcpy(dst.advanced(by: i * hiddenSize), src, hiddenSize * MemoryLayout<UInt16>.stride)
+            if tid == IMAGE_TOKEN_ID, let fp = featPtr, imageIdx < 280 {
+                // Vision encoder output is (1, 280, hidden). Copy slice `imageIdx`.
+                memcpy(dst.advanced(by: i * hiddenSize),
+                       fp.advanced(by: imageIdx * hiddenSize),
+                       hiddenSize * MemoryLayout<UInt16>.stride)
+                imageIdx += 1
+            } else {
+                let emb = try embedTokens.lookup(tid, shape: [1, 1, NSNumber(value: hiddenSize)])
+                let src = emb.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
+                memcpy(dst.advanced(by: i * hiddenSize), src,
+                       hiddenSize * MemoryLayout<UInt16>.stride)
+            }
         }
         return arr
     }
@@ -1139,30 +1185,78 @@ final class LLMRunner {
         return umask
     }
 
+    /// Preprocess image to match HuggingFace Gemma3nImageProcessor.
+    ///
+    /// Algorithm: aspect-ratio-preserving resize such that H×W ≤ 645,120 pixels
+    /// (= max_patches(2520) × patch_size²(256)), with each side rounded down to
+    /// a multiple of 48 (= pooling_kernel(3) × patch_size(16)). A square input
+    /// becomes 768×768 → 48×48=2304 patches → 256 soft tokens (padded to 280
+    /// inside the vision encoder).
+    ///
+    /// The vision model always outputs (1, 280, 1536) regardless of input grid,
+    /// so the text prompt always inserts 280 `<|image|>` placeholders.
+    ///
+    /// Pixel layout in each 768-d row: patch_h × patch_w × channels (row-major),
+    /// channels-last. Normalization: /255, no mean/std. Fp32 dtype.
     private func processImage(_ image: CGImage, with visionModel: MLModel) throws -> MLMultiArray {
-        let ps = 16, total = 2520, pd = 768, sz = 896
-        var pixels = [UInt8](repeating: 0, count: sz * sz * 4)
-        let ctx = CGContext(data: &pixels, width: sz, height: sz, bitsPerComponent: 8,
-                            bytesPerRow: sz * 4, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: sz, height: sz))
+        let ps = 16
+        let total = 2520    // max patches the vision encoder accepts
+        let pd = ps * ps * 3  // 768, flattened patch row
 
+        // 1. Compute aspect-ratio-preserving target size (each side multiple of 48).
+        let origH = Double(image.height)
+        let origW = Double(image.width)
+        let targetPx = Double(total * ps * ps)  // 645_120
+        let factor = sqrt(targetPx / (origH * origW))
+        let sideMult = 48  // pooling_kernel * patch_size
+        var tH = Int(floor(factor * origH / Double(sideMult))) * sideMult
+        var tW = Int(floor(factor * origW / Double(sideMult))) * sideMult
+        if tH < sideMult { tH = sideMult }
+        if tW < sideMult { tW = sideMult }
+        let Hp = tH / ps  // patches in height
+        let Wp = tW / ps  // patches in width
+        let realPatches = Hp * Wp  // ≤ 2520
+
+        // 2. Draw into an (tW, tH) RGBA canvas — Core Graphics handles bicubic resize.
+        var pixels = [UInt8](repeating: 0, count: tW * tH * 4)
+        let bitmap = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let ctx = CGContext(data: &pixels, width: tW, height: tH, bitsPerComponent: 8,
+                            bytesPerRow: tW * 4, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: bitmap.rawValue)!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: tW, height: tH))
+
+        // 3. Emit pixel_values (B, 2520, 768) fp32 and pixel_position_ids (B, 2520, 2) int32.
         let pv = try MLMultiArray(shape: [1, NSNumber(value: total), NSNumber(value: pd)], dataType: .float32)
         let pid = try MLMultiArray(shape: [1, NSNumber(value: total), 2], dataType: .int32)
         let pvp = pv.dataPointer.bindMemory(to: Float.self, capacity: total * pd)
         let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
+        memset(pvp, 0, total * pd * MemoryLayout<Float>.stride)
 
-        var pi = 0; let pps = sz / ps
-        for py in 0..<pps { for px in 0..<pps {
-            guard pi < total else { break }
-            var o = pi * pd
-            for dy in 0..<ps { for dx in 0..<ps {
-                let po = ((py * ps + dy) * sz + (px * ps + dx)) * 4
-                pvp[o] = Float(pixels[po])/255; pvp[o+1] = Float(pixels[po+1])/255; pvp[o+2] = Float(pixels[po+2])/255; o += 3
-            }}
-            pidp[pi*2] = Int32(px); pidp[pi*2+1] = Int32(py); pi += 1
-        }}
-        for i in pi..<total { pidp[i*2] = -1; pidp[i*2+1] = -1 }
+        var pi = 0
+        for py in 0..<Hp {
+            for px in 0..<Wp {
+                var o = pi * pd
+                for dy in 0..<ps {
+                    for dx in 0..<ps {
+                        let srcIdx = ((py * ps + dy) * tW + (px * ps + dx)) * 4
+                        pvp[o]   = Float(pixels[srcIdx])   / 255
+                        pvp[o+1] = Float(pixels[srcIdx+1]) / 255
+                        pvp[o+2] = Float(pixels[srcIdx+2]) / 255
+                        o += 3
+                    }
+                }
+                // Meshgrid order (x, y) = (px, py) — matches HF's indexing="xy".
+                pidp[pi * 2]     = Int32(px)
+                pidp[pi * 2 + 1] = Int32(py)
+                pi += 1
+            }
+        }
+        // Zero-pad pixel_values (done by memset above), mark position_ids as -1 for padding.
+        for i in realPatches..<total {
+            pidp[i * 2]     = -1
+            pidp[i * 2 + 1] = -1
+        }
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "pixel_values": MLFeatureValue(multiArray: pv),
@@ -1190,10 +1284,16 @@ final class LLMRunner {
             return p + "<|im_start|>assistant\n"
         }
         var p = "<bos>"
+        // HuggingFace Gemma3nProcessor wraps image tokens with BOI/EOI markers.
+        // For a single image: <|image> + <|image|> * 280 + <image|>
+        //   255999 (boi) + 258880 * 280 (image content, padded) + 258882 (eoi)
+        // The vision encoder always outputs 280 soft tokens regardless of actual
+        // grid (smaller grids are zero-padded), so we always insert 280 placeholders.
+        let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 280) + "<image|>"
         for m in messages {
             if m.role == .user {
                 if hasImage {
-                    p += "<|turn>user\n\n\n\(String(repeating: "<|image|>", count: 280))\n\n\(m.content)<turn|>\n"
+                    p += "<|turn>user\n\(imageBlock)\n\(m.content)<turn|>\n"
                 } else { p += "<|turn>user\n\(m.content)<turn|>\n" }
             } else if m.role == .assistant { p += "<|turn>model\n\(m.content)<turn|>\n" }
         }
