@@ -37,7 +37,7 @@ def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def _run_layer_stateless(
     layer, layer_idx, hidden_states,
-    cos_s, sin_s, cos_f, sin_f,
+    cos_s, sin_s, cos_f, sin_f,  # pre-computed, passed as inputs (ANE-friendly)
     causal_mask, update_mask,
     K_in, V_in,  # explicit KV cache input for this layer (None if KV-shared)
     config, per_layer_combined,
@@ -157,26 +157,15 @@ class StatelessChunk1(nn.Module):
     def __init__(self, model: Gemma4Model):
         super().__init__()
         self.config = model.config
-        self.embed_tokens = model.embed_tokens
+        # NO embed_tokens buffer — hidden_states passed as input (text or image
+        # embedding already selected externally). Eliminates gather op.
         self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.register_buffer("cos_sliding", model.cos_sliding)
-        self.register_buffer("sin_sliding", model.sin_sliding)
-        self.register_buffer("cos_full", model.cos_full)
-        self.register_buffer("sin_full", model.sin_full)
 
-    def forward(self, input_ids, position_ids, causal_mask, update_mask,
-                per_layer_combined, image_embedding,
-                K_in, V_in):  # (8, 1, ctx, max_hd) each
+    def forward(self, hidden_states, causal_mask, update_mask,
+                per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                K_in, V_in):
         config = self.config
-        text_emb = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        text_emb = text_emb * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
-        is_image = (image_embedding.abs().sum(dim=-1, keepdim=True) > 0).to(MODEL_DTYPE)
-        hidden_states = text_emb * (1 - is_image) + image_embedding * is_image
-
-        cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_s = torch.index_select(self.sin_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        cos_f = torch.index_select(self.cos_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_f = torch.index_select(self.sin_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
 
         # Dummy kv stores (not used in chunk1)
         dummy_13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
@@ -214,19 +203,12 @@ class StatelessChunk2(nn.Module):
         super().__init__()
         self.config = model.config
         self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.register_buffer("cos_sliding", model.cos_sliding)
-        self.register_buffer("sin_sliding", model.sin_sliding)
-        self.register_buffer("cos_full", model.cos_full)
-        self.register_buffer("sin_full", model.sin_full)
 
-    def forward(self, hidden_states, position_ids, causal_mask, update_mask,
-                per_layer_combined, K_in, V_in):
+    def forward(self, hidden_states, causal_mask, update_mask,
+                per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                K_in, V_in):
         config = self.config
-
-        cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_s = torch.index_select(self.sin_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        cos_f = torch.index_select(self.cos_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_f = torch.index_select(self.sin_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
 
         kv_store_13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
         kv_store_13_v = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
@@ -266,19 +248,12 @@ class StatelessChunk3(nn.Module):
         super().__init__()
         self.config = model.config
         self.layers = nn.ModuleList([model.layers[i] for i in range(self.START, self.END)])
-        self.register_buffer("cos_sliding", model.cos_sliding)
-        self.register_buffer("sin_sliding", model.sin_sliding)
-        self.register_buffer("cos_full", model.cos_full)
-        self.register_buffer("sin_full", model.sin_full)
 
-    def forward(self, hidden_states, position_ids, causal_mask, update_mask,
-                per_layer_combined, kv13_k, kv13_v, kv14_k, kv14_v):
+    def forward(self, hidden_states, causal_mask, update_mask,
+                per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
         config = self.config
-
-        cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_s = torch.index_select(self.sin_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        cos_f = torch.index_select(self.cos_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_f = torch.index_select(self.sin_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
 
         # All layers shared, no KV cache needed
         dummy_K = torch.zeros(1, 1, self.config.context_length,
@@ -314,19 +289,12 @@ class StatelessChunk4(nn.Module):
         self.lm_head.weight.data = model.lm_head.weight.data.clone()
         self.argmax = model.argmax
         self.softcap = model.softcap
-        self.register_buffer("cos_sliding", model.cos_sliding)
-        self.register_buffer("sin_sliding", model.sin_sliding)
-        self.register_buffer("cos_full", model.cos_full)
-        self.register_buffer("sin_full", model.sin_full)
 
-    def forward(self, hidden_states, position_ids, causal_mask, update_mask,
-                per_layer_combined, kv13_k, kv13_v, kv14_k, kv14_v):
+    def forward(self, hidden_states, causal_mask, update_mask,
+                per_layer_combined,
+                cos_s, sin_s, cos_f, sin_f,
+                kv13_k, kv13_v, kv14_k, kv14_v):
         config = self.config
-
-        cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_s = torch.index_select(self.sin_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        cos_f = torch.index_select(self.cos_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
-        sin_f = torch.index_select(self.sin_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
 
         dummy_K = torch.zeros(1, 1, self.config.context_length,
                               self.config.global_head_dim, dtype=MODEL_DTYPE)

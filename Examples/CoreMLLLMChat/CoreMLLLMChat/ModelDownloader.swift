@@ -164,6 +164,11 @@ final class ModelDownloader: NSObject {
             // Per-layer projection
             .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 27_525_120),
             .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 1_024),
+            // Pre-computed RoPE tables (cos/sin) — eliminates gather/greater_equal ops
+            .init(remotePath: "stateless/cos_sliding.npy", localPath: "cos_sliding.npy", estimatedSize: 524_416),
+            .init(remotePath: "stateless/sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 524_416),
+            .init(remotePath: "stateless/cos_full.npy", localPath: "cos_full.npy", estimatedSize: 1_048_704),
+            .init(remotePath: "stateless/sin_full.npy", localPath: "sin_full.npy", estimatedSize: 1_048_704),
             // Vision model for multimodal (lazy-loaded)
             .init(remotePath: "vision.mlmodelc/weights/weight.bin", localPath: "vision.mlmodelc/weights/weight.bin", estimatedSize: 320_000_000),
             .init(remotePath: "vision.mlmodelc/coremldata.bin", localPath: "vision.mlmodelc/coremldata.bin", estimatedSize: 200_000),

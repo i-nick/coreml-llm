@@ -91,7 +91,10 @@ final class LLMRunner {
         }
 
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = .all  // ANE for small chunks, .cpuAndGPU fallback for monolithic
+        // Verified on Mac: model fully ANE-compatible, 34 tok/s with forced ANE.
+        // On iPhone, .cpuAndNeuralEngine forces ANE and falls back to CPU (not GPU)
+        // for unsupported ops. GPU is excluded to guarantee ANE usage.
+        mlConfig.computeUnits = .cpuAndNeuralEngine
 
         let chunk1URL = findModel(in: folder, name: "chunk1")
         if chunk1URL != nil {
@@ -226,6 +229,13 @@ final class LLMRunner {
             perLayerProjF32 = f32
             perLayerProjWeight = nil
         }
+
+        // Pre-computed RoPE tables (cos/sin, per position)
+        loadingStatus = "Loading RoPE tables..."
+        cosSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("cos_sliding.npy"), options: .mappedIfSafe)
+        sinSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("sin_sliding.npy"), options: .mappedIfSafe)
+        cosFullTable = try? Data(contentsOf: folder.appendingPathComponent("cos_full.npy"), options: .mappedIfSafe)
+        sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
 
         useExternalPLE = true
         isChunked = true
@@ -475,44 +485,46 @@ final class LLMRunner {
         let ctx = contextLength
 
         let t0 = CFAbsoluteTimeGetCurrent()
-        let emb = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+        // External embedding (text by default). Image tokens: use imageEmbedding.
+        let textEmb = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+        let hiddenIn: MLMultiArray
+        if let imageEmbedding {
+            hiddenIn = imageEmbedding
+        } else {
+            hiddenIn = textEmb
+        }
         let t1 = CFAbsoluteTimeGetCurrent()
-        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: emb)
+        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: textEmb)
         let t2 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
         profilePLE += (t2 - t1)
 
-        let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
-        ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
-        let pos = try MLMultiArray(shape: [1], dataType: .int32)
-        pos[0] = NSNumber(value: Int32(position))
         let mask = try makeCausalMask(position: position, contextLength: ctx)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
-        let imgEmb: MLMultiArray
-        if let imageEmbedding {
-            imgEmb = imageEmbedding
-        } else {
-            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hiddenSize)], dataType: .float16)
-            memset(imgEmb.dataPointer, 0, hiddenSize * MemoryLayout<UInt16>.stride)
-        }
+        // Pre-computed RoPE for this position (from npy tables)
+        let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
+        let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
+        let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
+        let sinF = try lookupRoPE(table: sinFullTable, position: position, dim: 512)
 
         let tp = CFAbsoluteTimeGetCurrent()
 
-        // ---- Chunk 1: layers 0-7 + embedding ----
+        // ---- Chunk 1: layers 0-7 ----
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
-            "input_ids": MLFeatureValue(multiArray: ids),
-            "position_ids": MLFeatureValue(multiArray: pos),
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
-            "image_embedding": MLFeatureValue(multiArray: imgEmb),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "K_in": MLFeatureValue(multiArray: k1),
             "V_in": MLFeatureValue(multiArray: v1),
         ])
         let out1 = try chunk1.prediction(from: input1)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        // Update persistent KV1 buffers with new cache (copy into same buffer)
         let newK1 = out1.featureValue(for: "K_out")!.multiArrayValue!
         let newV1 = out1.featureValue(for: "V_out")!.multiArrayValue!
         memcpy(k1.dataPointer, newK1.dataPointer, k1.count * MemoryLayout<UInt16>.stride)
@@ -521,10 +533,13 @@ final class LLMRunner {
         // ---- Chunk 2: layers 8-14, emits kv13/14 ----
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
-            "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "K_in": MLFeatureValue(multiArray: k2),
             "V_in": MLFeatureValue(multiArray: v2),
         ])
@@ -542,10 +557,13 @@ final class LLMRunner {
         // ---- Chunk 3: layers 15-24 (shared KV) ----
         let input3 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h2),
-            "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "kv13_k": MLFeatureValue(multiArray: kv13_k),
             "kv13_v": MLFeatureValue(multiArray: kv13_v),
             "kv14_k": MLFeatureValue(multiArray: kv14_k),
@@ -557,10 +575,13 @@ final class LLMRunner {
         // ---- Chunk 4: layers 25-34 + norm + lm_head ----
         let input4 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h3),
-            "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
             "kv13_k": MLFeatureValue(multiArray: kv13_k),
             "kv13_v": MLFeatureValue(multiArray: kv13_v),
             "kv14_k": MLFeatureValue(multiArray: kv14_k),
