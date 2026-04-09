@@ -73,17 +73,25 @@ final class LLMRunner {
             if let es2 = json["per_layer_embed_scale"] as? Double { perLayerEmbedScale = Float(es2) }
         }
 
+        // Try ANE first, fall back to CPU+GPU if ANE compilation fails
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = .all
 
-        // Detect: chunked or monolithic?
         let chunk1URL = findModel(in: folder, name: "chunk1")
-        if let c1url = chunk1URL {
-            // Chunked model
-            try await loadChunked(folder: folder, config: mlConfig)
-        } else {
-            // Monolithic model
-            try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+        do {
+            if chunk1URL != nil {
+                try await loadChunked(folder: folder, config: mlConfig)
+            } else {
+                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+            }
+        } catch {
+            loadingStatus = "ANE failed, using CPU+GPU..."
+            mlConfig.computeUnits = .cpuAndGPU
+            if chunk1URL != nil {
+                try await loadChunked(folder: folder, config: mlConfig)
+            } else {
+                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+            }
         }
 
         // Vision model
