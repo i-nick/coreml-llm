@@ -9,10 +9,22 @@ import Tokenizers
 ///
 /// ```swift
 /// let llm = try await CoreMLLLM.load(from: modelDirectory)
-/// let answer = try await llm.generate("What is the capital of France?")
-/// // → "The capital of France is **Paris**."
 ///
+/// // Simple single-turn
+/// let answer = try await llm.generate("What is the capital of France?")
+///
+/// // Streaming
 /// for await token in try await llm.stream("Tell me a story") {
+///     print(token, terminator: "")
+/// }
+///
+/// // Multi-turn conversation
+/// let messages: [CoreMLLLM.Message] = [
+///     .init(role: .user, content: "Hi!"),
+///     .init(role: .assistant, content: "Hello!"),
+///     .init(role: .user, content: "What is 2+2?"),
+/// ]
+/// for await token in try await llm.stream(messages) {
 ///     print(token, terminator: "")
 /// }
 /// ```
@@ -38,6 +50,28 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var audioMelFrames: Int = 200
     private var audioNumTokens: Int = 50
 
+    // Multi-turn: cache image features across turns
+    private var cachedImageFeatures: MLMultiArray?
+
+    // Generation metrics
+    public private(set) var tokensPerSecond: Double = 0
+
+    // MARK: - Public Types
+
+    /// A message in a multi-turn conversation.
+    public struct Message: Sendable {
+        public enum Role: String, Sendable {
+            case user, assistant, system
+        }
+        public let role: Role
+        public let content: String
+
+        public init(role: Role, content: String) {
+            self.role = role
+            self.content = content
+        }
+    }
+
     private init(config: ModelConfig, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
@@ -54,13 +88,17 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// - Parameters:
     ///   - directory: Folder containing model files, embeddings, config
     ///   - computeUnits: CoreML compute units (default: `.cpuAndNeuralEngine`)
+    ///   - onProgress: Optional callback for loading status updates
     public static func load(
         from directory: URL,
-        computeUnits: MLComputeUnits = .cpuAndNeuralEngine
+        computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
+        onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
+        onProgress?("Reading config...")
         let config = try ModelConfig.load(from: directory)
 
         // Tokenizer
+        onProgress?("Loading tokenizer...")
         let tokDir = directory.appendingPathComponent("hf_model")
         let tokenizer = try await AutoTokenizer.from(modelFolder: tokDir)
 
@@ -73,6 +111,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                 atPath: directory.appendingPathComponent("chunk1.mlpackage").path)
 
         if isChunked {
+            onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
         } else {
@@ -80,8 +119,10 @@ public final class CoreMLLLM: @unchecked Sendable {
             mlConfig.computeUnits = computeUnits
             let modelURL = directory.appendingPathComponent("model.mlmodelc")
             if FileManager.default.fileExists(atPath: modelURL.path) {
+                onProgress?("Loading model...")
                 llm.monolithicModel = try MLModel(contentsOf: modelURL, configuration: mlConfig)
             } else {
+                onProgress?("Compiling model...")
                 let pkgURL = directory.appendingPathComponent("model.mlpackage")
                 let compiled = try await MLModel.compileModel(at: pkgURL)
                 llm.monolithicModel = try MLModel(contentsOf: compiled, configuration: mlConfig)
@@ -116,13 +157,11 @@ public final class CoreMLLLM: @unchecked Sendable {
             cfg.computeUnits = .cpuAndGPU
             llm.audioConfig = cfg
 
-            // Load mel filterbank
             let melURL = directory.appendingPathComponent("mel_filterbank.bin")
             if FileManager.default.fileExists(atPath: melURL.path) {
                 llm.melFilterbank = try? AudioProcessor.loadMelFilterbank(from: melURL)
             }
 
-            // Load audio config for frame/token counts
             let audioConfURL = directory.appendingPathComponent("audio_config.json")
             if let data = try? Data(contentsOf: audioConfURL),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -131,6 +170,7 @@ public final class CoreMLLLM: @unchecked Sendable {
             }
         }
 
+        onProgress?("Ready")
         return llm
     }
 
@@ -143,35 +183,70 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Model name from config.
     public var modelName: String { config.modelName }
 
-    /// Generate a complete response.
+    /// Context length from config.
+    public var contextLength: Int { config.contextLength }
+
+    // MARK: - Single-turn convenience
+
+    /// Generate a complete response from a single prompt.
     public func generate(_ prompt: String, image: CGImage? = nil,
                          audio: [Float]? = nil,
-                         maxTokens: Int = 256) async throws -> String {
+                         maxTokens: Int = 2048) async throws -> String {
+        let messages = [Message(role: .user, content: prompt)]
+        return try await generate(messages, image: image, audio: audio, maxTokens: maxTokens)
+    }
+
+    /// Stream tokens from a single prompt.
+    public func stream(_ prompt: String, image: CGImage? = nil,
+                       audio: [Float]? = nil,
+                       maxTokens: Int = 2048) async throws -> AsyncStream<String> {
+        let messages = [Message(role: .user, content: prompt)]
+        return try await stream(messages, image: image, audio: audio, maxTokens: maxTokens)
+    }
+
+    // MARK: - Multi-turn API
+
+    /// Generate a complete response from a conversation.
+    public func generate(_ messages: [Message], image: CGImage? = nil,
+                         audio: [Float]? = nil,
+                         maxTokens: Int = 2048) async throws -> String {
         var result = ""
-        for await token in try await stream(prompt, image: image, audio: audio,
+        for await token in try await stream(messages, image: image, audio: audio,
                                              maxTokens: maxTokens) {
             result += token
         }
         return result
     }
 
-    /// Stream tokens as they're generated.
-    public func stream(_ prompt: String, image: CGImage? = nil,
+    /// Stream tokens from a multi-turn conversation.
+    ///
+    /// If `image` is provided, it's processed and cached for the current turn.
+    /// If `image` is nil but a previous image was cached, the cached features are reused.
+    public func stream(_ messages: [Message], image: CGImage? = nil,
                        audio: [Float]? = nil,
-                       maxTokens: Int = 256) async throws -> AsyncStream<String> {
-        let chatPrompt = buildPrompt(prompt, hasImage: image != nil,
-                                     hasAudio: audio != nil)
-        let tokenIDs = tokenizer.encode(text: chatPrompt)
-
-        var imageFeatures: MLMultiArray?
+                       maxTokens: Int = 2048) async throws -> AsyncStream<String> {
+        // Process image (or reuse cached)
+        var imageFeatures: MLMultiArray? = cachedImageFeatures
         if let image {
             imageFeatures = try processImage(image)
+            cachedImageFeatures = imageFeatures
         }
 
+        // Process audio
         var audioFeatures: MLMultiArray?
         if let audio {
+            print("[CoreMLLLM] audio: \(audio.count) samples (\(String(format: "%.2f", Double(audio.count)/16000.0))s)")
             audioFeatures = try processAudio(audio)
+            print("[CoreMLLLM] audioFeatures: \(audioFeatures!.shape)")
+        } else {
+            print("[CoreMLLLM] audio: nil")
         }
+
+        let hasImage = imageFeatures != nil
+        let hasAudioInput = audioFeatures != nil
+        let chatPrompt = buildPrompt(messages, hasImage: hasImage, hasAudio: hasAudioInput)
+        let tokenIDs = tokenizer.encode(text: chatPrompt)
+        print("[CoreMLLLM] hasAudio=\(hasAudioInput), tokens=\(tokenIDs.count), audioTokens=\(tokenIDs.filter{$0==258881}.count)")
 
         reset()
 
@@ -180,6 +255,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         let audFeats = audioFeatures
         let tokens = tokenIDs
         let audTokenCount = mutableSelf.audioNumTokens
+        let ctxLimit = config.contextLength
 
         return AsyncStream { continuation in
             Task {
@@ -190,7 +266,6 @@ public final class CoreMLLLM: @unchecked Sendable {
                     var audioIdx = 0
                     var nextID = 0
 
-                    // Helper: resolve multimodal embedding for a token
                     func multimodalEmbedding(for tid: Int) -> MLMultiArray? {
                         if tid == IMAGE_TOKEN_ID, let f = imgFeats, imageIdx < 256 {
                             let emb = engine?.sliceFeature(f, at: imageIdx)
@@ -212,22 +287,21 @@ public final class CoreMLLLM: @unchecked Sendable {
                     let engine = mutableSelf.chunkedEngine
 
                     if let engine {
-                        // Chunked path: hybrid prefill + decode
                         let prefillLen = min(tokens.count, engine.prefillN)
                         let useHybrid = engine.hasPrefill && prefillLen > 0
 
                         if useHybrid {
                             try autoreleasepool {
                                 let batch = Array(tokens[0..<prefillLen])
-                                // Prefill with image features (audio uses per-token path)
                                 nextID = try engine.runPrefill(tokenIDs: batch,
-                                                               imageFeatures: imgFeats)
+                                                               imageFeatures: imgFeats,
+                                                               audioFeatures: audFeats,
+                                                               audioNumTokens: audTokenCount)
                             }
                             imageIdx = tokens[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
                             audioIdx = tokens[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count
                             engine.currentPosition = prefillLen
 
-                            // Per-token decode for remaining prompt tokens
                             for step in prefillLen..<tokens.count {
                                 let tid = tokens[step]
                                 try autoreleasepool {
@@ -254,13 +328,20 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         }
 
-                        // Decode loop
+                        // Decode loop with tok/s tracking
                         let eosIDs: Set<Int> = [1, 106, 151645]
-                        for _ in 0..<maxTokens {
+                        let startTime = CFAbsoluteTimeGetCurrent()
+                        var tokenCount = 0
+                        let maxDecode = min(ctxLimit - engine.currentPosition, maxTokens)
+
+                        for _ in 0..<maxDecode {
                             if eosIDs.contains(nextID) { break }
-                            if engine.currentPosition >= mutableSelf.config.contextLength { break }
+                            if engine.currentPosition >= ctxLimit { break }
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
+                            tokenCount += 1
+                            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                            if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
                             try autoreleasepool {
                                 nextID = try engine.predictStep(tokenID: nextID,
                                                                  position: engine.currentPosition)
@@ -279,11 +360,16 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         }
                         let eosIDs: Set<Int> = [1, 106, 151645]
+                        let startTime = CFAbsoluteTimeGetCurrent()
                         var pos = tokens.count
+                        var tokenCount = 0
                         for _ in 0..<maxTokens {
                             if eosIDs.contains(nextID) { break }
                             let text = mutableSelf.tokenizer.decode(tokens: [nextID])
                             continuation.yield(text)
+                            tokenCount += 1
+                            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                            if elapsed > 0 { mutableSelf.tokensPerSecond = Double(tokenCount) / elapsed }
                             nextID = try mutableSelf.predictMonolithic(
                                 tokenID: nextID, position: pos)
                             pos += 1
@@ -295,13 +381,19 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
     }
 
-    /// Reset conversation state (clears KV cache).
+    /// Reset conversation state (clears KV cache and cached image features).
     public func reset() {
         if let engine = chunkedEngine {
             engine.reset()
         } else {
             monolithicState = monolithicModel?.makeState()
         }
+        tokensPerSecond = 0
+    }
+
+    /// Clear cached image features (called between conversations).
+    public func clearImageCache() {
+        cachedImageFeatures = nil
     }
 
     // MARK: - Private: monolithic prediction
@@ -379,21 +471,50 @@ public final class CoreMLLLM: @unchecked Sendable {
 
     // MARK: - Private: prompt building
 
-    private func buildPrompt(_ text: String, hasImage: Bool,
+    private func buildPrompt(_ messages: [Message], hasImage: Bool,
                               hasAudio: Bool = false) -> String {
         if config.architecture.hasPrefix("qwen") {
-            return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n\(text)<|im_end|>\n<|im_start|>assistant\n"
+            return buildQwenPrompt(messages)
         }
-        var mediaPrefix = ""
-        if hasImage {
-            let imageTokens = String(repeating: "<|image|>", count: 256)
-            mediaPrefix += "<|image>\(imageTokens)<image|>\n"
+        return buildGemmaPrompt(messages, hasImage: hasImage, hasAudio: hasAudio)
+    }
+
+    private func buildGemmaPrompt(_ messages: [Message], hasImage: Bool, hasAudio: Bool) -> String {
+        let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
+        let audioBlock = "<|audio>" + String(repeating: "<|audio|>", count: audioNumTokens) + "<audio|>"
+        let lastUserIdx = messages.lastIndex { $0.role == .user }
+
+        var p = "<bos>"
+        for (i, m) in messages.enumerated() {
+            switch m.role {
+            case .user:
+                let isLast = i == lastUserIdx
+                var mediaPrefix = ""
+                if hasImage && isLast { mediaPrefix += imageBlock + "\n" }
+                if hasAudio && isLast { mediaPrefix += audioBlock + "\n" }
+                p += "<|turn>user\n\(mediaPrefix)\(m.content)<turn|>\n"
+            case .assistant:
+                p += "<|turn>model\n\(m.content)<turn|>\n"
+            case .system:
+                break
+            }
         }
-        if hasAudio {
-            let audioTokens = String(repeating: "<|audio|>", count: audioNumTokens)
-            mediaPrefix += "<|audio>\(audioTokens)<audio|>\n"
+        return p + "<|turn>model\n"
+    }
+
+    private func buildQwenPrompt(_ messages: [Message]) -> String {
+        var p = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        for m in messages {
+            switch m.role {
+            case .user:
+                p += "<|im_start|>user\n\(m.content)<|im_end|>\n"
+            case .assistant:
+                p += "<|im_start|>assistant\n\(m.content)<|im_end|>\n"
+            case .system:
+                break
+            }
         }
-        return "<bos><|turn>user\n\(mediaPrefix)\(text)<turn|>\n<|turn>model\n"
+        return p + "<|im_start|>assistant\n"
     }
 }
 
