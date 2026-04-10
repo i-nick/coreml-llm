@@ -131,8 +131,8 @@ final class ModelDownloader: NSObject {
     private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
         let base = model.downloadURL
 
-        // v0.5.1: 8K context chunks (same weights, larger KV shapes).
-        let sdpaPrefix = "sdpa-8k/"
+        // 8K context (model.mil updated in-place, weights unchanged from 2048).
+        let sdpaPrefix = "sdpa/"
         var files: [DownloadFile]
 
         // Download .mlmodelc (compiled via coremltools MLModel.get_compiled_model_path).
