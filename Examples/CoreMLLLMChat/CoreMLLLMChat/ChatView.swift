@@ -11,6 +11,10 @@ struct ChatView: View {
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
 
+    // Audio recording
+    @State private var audioRecorder = AudioRecorder()
+    @State private var recordedAudio: [Float]?
+
     // Battery benchmark state
     @State private var benchmarkRunning = false
     @State private var benchmarkStatus: String = ""
@@ -83,6 +87,31 @@ struct ChatView: View {
                         Button { clearImage() } label: {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 4)
+                }
+
+                // Audio preview
+                if recordedAudio != nil || audioRecorder.isRecording {
+                    HStack {
+                        Image(systemName: "waveform")
+                            .foregroundStyle(.purple)
+                        if audioRecorder.isRecording {
+                            Text(String(format: "Recording... %.1fs", audioRecorder.duration))
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text(String(format: "Audio ready (%.1fs)",
+                                        Double(recordedAudio?.count ?? 0) / 16000.0))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if !audioRecorder.isRecording {
+                            Button { recordedAudio = nil } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         Spacer()
                     }
@@ -181,6 +210,16 @@ struct ChatView: View {
                 .disabled(runner.isGenerating)
             }
 
+            // Mic button (only for audio-capable models)
+            if runner.hasAudio {
+                Button { toggleRecording() } label: {
+                    Image(systemName: audioRecorder.isRecording ? "stop.circle.fill" : "mic")
+                        .font(.title3)
+                        .foregroundStyle(audioRecorder.isRecording ? .red : .accentColor)
+                }
+                .disabled(runner.isGenerating)
+            }
+
             TextField("Message", text: $inputText, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
@@ -208,7 +247,11 @@ struct ChatView: View {
             do {
                 try await runner.loadModel(from: modelURL)
                 await MainActor.run {
-                    messages.append(ChatMessage(role: .system, content: "Model loaded! " + (runner.hasVision ? "Image input enabled." : "")))
+                    var caps = [String]()
+                    if runner.hasVision { caps.append("Image") }
+                    if runner.hasAudio { caps.append("Audio") }
+                    let capsStr = caps.isEmpty ? "" : " " + caps.joined(separator: " + ") + " enabled."
+                    messages.append(ChatMessage(role: .system, content: "Model loaded!" + capsStr))
                 }
             } catch {
                 await MainActor.run {
@@ -223,16 +266,22 @@ struct ChatView: View {
         guard !text.isEmpty else { return }
 
         let attachedImageData = selectedImageData
-        messages.append(ChatMessage(role: .user, content: text, imageData: attachedImageData))
+        let hasAudioAttachment = recordedAudio != nil
+        var content = text
+        if hasAudioAttachment { content = "[Audio] " + text }
+        messages.append(ChatMessage(role: .user, content: content, imageData: attachedImageData))
         inputText = ""
         streamingText = ""
 
         let image = selectedImage
+        let audio = recordedAudio
         clearImage()
+        recordedAudio = nil
 
         Task {
             do {
-                let stream = try await runner.generate(messages: messages, image: image)
+                let stream = try await runner.generate(messages: messages, image: image,
+                                                        audio: audio)
                 for await token in stream {
                     streamingText += token
                 }
@@ -242,6 +291,19 @@ struct ChatView: View {
                 }
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    private func toggleRecording() {
+        if audioRecorder.isRecording {
+            recordedAudio = audioRecorder.stop()
+        } else {
+            do {
+                try audioRecorder.start()
+            } catch {
+                messages.append(ChatMessage(role: .system,
+                    content: "Mic error: \(error.localizedDescription)"))
             }
         }
     }

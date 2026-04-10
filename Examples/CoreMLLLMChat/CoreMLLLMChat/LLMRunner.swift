@@ -15,6 +15,7 @@ final class LLMRunner {
     var tokensPerSecond: Double = 0
     var modelName = ""
     var hasVision = false
+    var hasAudio = false
 
     // Monolithic model
     private var model: MLModel?
@@ -71,6 +72,14 @@ final class LLMRunner {
 
     // Cached image features (persist across turns until Clear)
     private var cachedImageFeatures: MLMultiArray?
+
+    // Audio (lazy-loaded)
+    private var audioModel: MLModel?
+    private var audioModelURL: URL?
+    private var audioConfig: MLModelConfiguration?
+    private var melFilterbank: [Float]?
+    private var audioMelFrames = 200
+    private var audioNumTokens = 50
 
     // Shared
     private var tokenizer: (any Tokenizer)?
@@ -135,6 +144,35 @@ final class LLMRunner {
             let visionCfg = MLModelConfiguration()
             visionCfg.computeUnits = .cpuAndGPU
             visionConfig = visionCfg
+        }
+
+        // Audio model: defer loading to save memory (loaded on first audio)
+        if findModel(in: folder, name: "audio") != nil {
+            audioModelURL = findModel(in: folder, name: "audio")
+            let audioCfg = MLModelConfiguration()
+            audioCfg.computeUnits = .cpuAndGPU
+            audioConfig = audioCfg
+
+            let melURL = folder.appendingPathComponent("mel_filterbank.bin")
+            if FileManager.default.fileExists(atPath: melURL.path) {
+                let data = try Data(contentsOf: melURL, options: .mappedIfSafe)
+                let count = 257 * 128
+                melFilterbank = [Float](repeating: 0, count: count)
+                data.withUnsafeBytes { raw in
+                    let src = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+                    for i in 0..<min(count, data.count / MemoryLayout<Float>.stride) {
+                        melFilterbank![i] = src[i]
+                    }
+                }
+                hasAudio = true
+            }
+
+            let audioConfURL = folder.appendingPathComponent("audio_config.json")
+            if let data = try? Data(contentsOf: audioConfURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                audioMelFrames = json["mel_frames"] as? Int ?? 200
+                audioNumTokens = json["num_tokens"] as? Int ?? 50
+            }
         }
 
         // Tokenizer
@@ -413,7 +451,8 @@ final class LLMRunner {
 
     // MARK: - Generation
 
-    func generate(messages: [ChatMessage], image: CGImage? = nil) async throws -> AsyncStream<String> {
+    func generate(messages: [ChatMessage], image: CGImage? = nil,
+                  audio: [Float]? = nil) async throws -> AsyncStream<String> {
         guard tokenizer != nil, (model != nil || chunk1 != nil) else {
             throw NSError(domain: "LLMRunner", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
         }
@@ -433,8 +472,23 @@ final class LLMRunner {
             }
         }
 
+        // Process audio if provided.
+        var audioFeatures: MLMultiArray?
+        if let audio {
+            if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
+                loadingStatus = "Loading audio model..."
+                audioModel = try MLModel(contentsOf: url, configuration: cfg)
+            }
+            if let am = audioModel, let mel = melFilterbank {
+                loadingStatus = "Processing audio..."
+                audioFeatures = try processAudio(audio, with: am, melFilterbank: mel)
+            }
+        }
+
         let hasImage = imageFeatures != nil
-        let prompt = buildPrompt(messages: messages, hasImage: hasImage)
+        let hasAudioInput = audioFeatures != nil
+        let prompt = buildPrompt(messages: messages, hasImage: hasImage,
+                                 hasAudio: hasAudioInput)
         let tokenIDs = tokenizer!.encode(text: prompt)
 
         resetConversation()
@@ -444,8 +498,25 @@ final class LLMRunner {
                 defer { self.isGenerating = false }
                 do {
                     let IMAGE_TOKEN_ID = 258880
+                    let AUDIO_TOKEN_ID = 258881
                     var imageIdx = 0
+                    var audioIdx = 0
                     var nextID = 0
+
+                    // Helper: resolve multimodal embedding for image/audio tokens
+                    func multimodalEmb(tid: Int) -> MLMultiArray? {
+                        if tid == IMAGE_TOKEN_ID, let f = imageFeatures, imageIdx < 256 {
+                            let e = self.sliceFeature(f, at: imageIdx)
+                            imageIdx += 1
+                            return e
+                        }
+                        if tid == AUDIO_TOKEN_ID, let f = audioFeatures, audioIdx < self.audioNumTokens {
+                            let e = self.sliceFeature(f, at: audioIdx)
+                            audioIdx += 1
+                            return e
+                        }
+                        return nil
+                    }
 
                     // Prefill with progress — wrap each step in autoreleasepool
                     // to drain CoreML MLMultiArray allocations (prevents memory growth)
@@ -472,10 +543,12 @@ final class LLMRunner {
                         self.loadingStatus = "Prefill (batch \(prefillLen)/\(tokenIDs.count))..."
                         try autoreleasepool {
                             let batch = Array(tokenIDs[0..<prefillLen])
-                            nextID = try self.runPrefill(tokenIDs: batch, imageFeatures: imageFeatures)
+                            nextID = try self.runPrefill(tokenIDs: batch, imageFeatures: imageFeatures,
+                                                         audioFeatures: audioFeatures)
                         }
-                        // Advance imageIdx by image tokens consumed in the prefill batch.
+                        // Advance indices by tokens consumed in the prefill batch.
                         imageIdx = tokenIDs[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
+                        audioIdx = tokenIDs[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count
                         self.currentPosition = prefillLen
 
                         // Per-token decode for remaining prompt tokens (if any).
@@ -483,10 +556,8 @@ final class LLMRunner {
                             for step in prefillLen..<tokenIDs.count {
                                 let tid = tokenIDs[step]
                                 try autoreleasepool {
-                                    if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
-                                        let imgEmb = self.sliceFeature(feats, at: imageIdx)
-                                        nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
-                                        imageIdx += 1
+                                    if let emb = multimodalEmb(tid: tid) {
+                                        nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: emb)
                                     } else {
                                         nextID = try self.predictStep(tokenID: tid, position: step)
                                     }
@@ -498,10 +569,8 @@ final class LLMRunner {
                     } else {
                         for (step, tid) in tokenIDs.enumerated() {
                             try autoreleasepool {
-                                if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
-                                    let imgEmb = self.sliceFeature(feats, at: imageIdx)
-                                    nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
-                                    imageIdx += 1
+                                if let emb = multimodalEmb(tid: tid) {
+                                    nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: emb)
                                 } else {
                                     nextID = try self.predictStep(tokenID: tid, position: step)
                                 }
@@ -806,7 +875,8 @@ final class LLMRunner {
     /// If `imageFeatures` is non-nil, tokens matching IMAGE_TOKEN_ID are replaced
     /// with the corresponding vision encoder feature vector at the appropriate
     /// position in the hidden_states batch.
-    private func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil) throws -> Int {
+    private func runPrefill(tokenIDs: [Int], imageFeatures: MLMultiArray? = nil,
+                            audioFeatures: MLMultiArray? = nil) throws -> Int {
         guard let p1 = prefillChunk1, let p2 = prefillChunk2,
               let p3 = prefillChunk3, let p4 = prefillChunk4,
               let embedTokens,
@@ -833,7 +903,8 @@ final class LLMRunner {
         // Build inputs common to all chunks.
         let hiddenIn = try buildPrefillHiddenStates(tokenIDs: tokenIDs, N: N,
                                                      embedTokens: embedTokens,
-                                                     imageFeatures: imageFeatures)
+                                                     imageFeatures: imageFeatures,
+                                                     audioFeatures: audioFeatures)
         let plRaw = try buildPrefillPerLayerRaw(tokenIDs: tokenIDs, N: N)
         let causal = try makePrefillCausalMask(N: N)
         let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
@@ -961,21 +1032,30 @@ final class LLMRunner {
     /// occurrences are replaced in place with the vision encoder features.
     private func buildPrefillHiddenStates(tokenIDs: [Int], N: Int,
                                            embedTokens: EmbeddingLookup,
-                                           imageFeatures: MLMultiArray? = nil) throws -> MLMultiArray {
+                                           imageFeatures: MLMultiArray? = nil,
+                                           audioFeatures: MLMultiArray? = nil) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hiddenSize)], dataType: .float16)
         memset(arr.dataPointer, 0, N * hiddenSize * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * hiddenSize)
-        let featPtr = imageFeatures?.dataPointer.bindMemory(
-            to: UInt16.self, capacity: imageFeatures!.count)
+        let imgPtr = imageFeatures?.dataPointer.bindMemory(
+            to: UInt16.self, capacity: imageFeatures?.count ?? 0)
+        let audPtr = audioFeatures?.dataPointer.bindMemory(
+            to: UInt16.self, capacity: audioFeatures?.count ?? 0)
         var imageIdx = 0
+        var audioIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = featPtr, imageIdx < 256 {
-                // Vision encoder output is (1, 280, hidden). Copy slice `imageIdx`.
+            if tid == IMAGE_TOKEN_ID, let fp = imgPtr, imageIdx < 256 {
                 memcpy(dst.advanced(by: i * hiddenSize),
                        fp.advanced(by: imageIdx * hiddenSize),
                        hiddenSize * MemoryLayout<UInt16>.stride)
                 imageIdx += 1
+            } else if tid == AUDIO_TOKEN_ID, let ap = audPtr, audioIdx < audioNumTokens {
+                memcpy(dst.advanced(by: i * hiddenSize),
+                       ap.advanced(by: audioIdx * hiddenSize),
+                       hiddenSize * MemoryLayout<UInt16>.stride)
+                audioIdx += 1
             } else {
                 let emb = try embedTokens.lookup(tid, shape: [1, 1, NSNumber(value: hiddenSize)])
                 let src = emb.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
@@ -991,13 +1071,14 @@ final class LLMRunner {
     /// the projection of vision features inside chunk1, not from token lookup.
     private func buildPrefillPerLayerRaw(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
         let IMAGE_TOKEN_ID = 258880
+        let AUDIO_TOKEN_ID = 258881
         guard let embedPerLayer else { throw NSError(domain: "LLMRunner", code: 11) }
         let totalDim = 35 * perLayerDim
         let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: totalDim)], dataType: .float16)
         memset(arr.dataPointer, 0, N * totalDim * MemoryLayout<UInt16>.stride)
         let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * totalDim)
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID { continue }  // leave as zero
+            if tid == IMAGE_TOKEN_ID || tid == AUDIO_TOKEN_ID { continue }  // leave as zero
             let raw = embedPerLayer.lookupRaw(tid)
             for j in 0..<totalDim {
                 dst[i * totalDim + j] = raw[j]
@@ -1345,6 +1426,125 @@ final class LLMRunner {
         return try visionModel.prediction(from: input).featureValue(for: "image_features")!.multiArrayValue!
     }
 
+    private func processAudio(_ samples: [Float], with audioModel: MLModel,
+                              melFilterbank: [Float]) throws -> MLMultiArray {
+        // Mel spectrogram parameters matching HF Gemma4AudioFeatureExtractor
+        let frameLength = 320
+        let hopLength = 160
+        let fftLength = 512
+        let numMelBins = 128
+        let numFFTBins = fftLength / 2 + 1  // 257
+        let melFloor: Float = 0.001
+        let targetFrames = audioMelFrames
+
+        // 1. Semicausal pad (prepend frameLength/2 zeros)
+        let padLeft = frameLength / 2
+        var padded = [Float](repeating: 0, count: padLeft + samples.count)
+        for i in 0..<samples.count { padded[padLeft + i] = samples[i] }
+
+        // 2. Frame extraction
+        let unfoldSize = frameLength + 1
+        let numFrames = max(0, (padded.count - unfoldSize) / hopLength + 1)
+        let actualFrames = min(numFrames, targetFrames)
+
+        // Hann window
+        var window = [Float](repeating: 0, count: frameLength)
+        for n in 0..<frameLength {
+            window[n] = 0.5 - 0.5 * cos(2 * .pi * Float(n) / Float(frameLength))
+        }
+
+        // FFT setup
+        let log2n = vDSP_Length(log2(Double(fftLength)))
+        guard let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
+            throw NSError(domain: "Audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "FFT setup failed"])
+        }
+        defer { vDSP_destroy_fftsetup(fftSetup) }
+
+        var melSpec = [Float](repeating: 0, count: targetFrames * numMelBins)
+        var realp = [Float](repeating: 0, count: fftLength / 2)
+        var imagp = [Float](repeating: 0, count: fftLength / 2)
+        var windowed = [Float](repeating: 0, count: fftLength)
+        var magnitude = [Float](repeating: 0, count: numFFTBins)
+
+        for f in 0..<actualFrames {
+            let start = f * hopLength
+            // Extract frame (321 samples), drop last → 320
+            for i in 0..<frameLength {
+                let idx = start + i
+                windowed[i] = idx < padded.count ? padded[idx] * window[i] : 0
+            }
+            for i in frameLength..<fftLength { windowed[i] = 0 }
+
+            // FFT
+            windowed.withUnsafeBufferPointer { buf in
+                buf.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: fftLength / 2) { cp in
+                    realp.withUnsafeMutableBufferPointer { rp in
+                        imagp.withUnsafeMutableBufferPointer { ip in
+                            var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                            vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(fftLength / 2))
+                            vDSP_fft_zrip(fftSetup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
+                        }
+                    }
+                }
+            }
+
+            // Scale (vDSP FFT has 2x factor)
+            var half: Float = 0.5
+            vDSP_vsmul(realp, 1, &half, &realp, 1, vDSP_Length(fftLength / 2))
+            vDSP_vsmul(imagp, 1, &half, &imagp, 1, vDSP_Length(fftLength / 2))
+
+            // Magnitude
+            magnitude[0] = abs(realp[0])
+            for k in 1..<(fftLength / 2) {
+                magnitude[k] = sqrt(realp[k] * realp[k] + imagp[k] * imagp[k])
+            }
+            magnitude[fftLength / 2] = abs(imagp[0])
+
+            // Mel filterbank matmul + log
+            let melOffset = f * numMelBins
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        Int32(numFFTBins), Int32(numMelBins),
+                        1.0, melFilterbank, Int32(numMelBins),
+                        magnitude, 1, 0.0, &melSpec[melOffset], 1)
+            for i in 0..<numMelBins {
+                melSpec[melOffset + i] = log(melSpec[melOffset + i] + melFloor)
+            }
+        }
+
+        // Fill remaining frames with log(mel_floor)
+        if actualFrames < targetFrames {
+            let logFloor = log(melFloor)
+            for i in (actualFrames * numMelBins)..<(targetFrames * numMelBins) {
+                melSpec[i] = logFloor
+            }
+        }
+
+        // Convert to MLMultiArray (1, targetFrames, 128) float16
+        let result = try MLMultiArray(
+            shape: [1, NSNumber(value: targetFrames), NSNumber(value: numMelBins)],
+            dataType: .float16)
+        let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: targetFrames * numMelBins)
+        melSpec.withUnsafeBufferPointer { src in
+            var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
+                                        height: 1, width: vImagePixelCount(targetFrames * numMelBins),
+                                        rowBytes: targetFrames * numMelBins * MemoryLayout<Float>.stride)
+            var dstBuf = vImage_Buffer(data: dst,
+                                        height: 1, width: vImagePixelCount(targetFrames * numMelBins),
+                                        rowBytes: targetFrames * numMelBins * MemoryLayout<UInt16>.stride)
+            vImageConvert_PlanarFtoPlanar16F(&srcBuf, &dstBuf, 0)
+        }
+
+        // Run audio CoreML model
+        let input = try MLDictionaryFeatureProvider(dictionary: [
+            "input_features": MLFeatureValue(multiArray: result),
+        ])
+        guard let features = try audioModel.prediction(from: input)
+                .featureValue(for: "audio_features")?.multiArrayValue else {
+            throw NSError(domain: "Audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Audio prediction failed"])
+        }
+        return features
+    }
+
     private func sliceFeature(_ features: MLMultiArray, at index: Int) -> MLMultiArray {
         let hs = hiddenSize
         let r = try! MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
@@ -1354,7 +1554,8 @@ final class LLMRunner {
         return r
     }
 
-    private func buildPrompt(messages: [ChatMessage], hasImage: Bool) -> String {
+    private func buildPrompt(messages: [ChatMessage], hasImage: Bool,
+                              hasAudio: Bool = false) -> String {
         if architecture.hasPrefix("qwen") {
             var p = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
             for m in messages {
@@ -1373,14 +1574,19 @@ final class LLMRunner {
         // states which it tries to interpret → garbled output.
         // For a single square image: <|image> + <|image|> * 256 + <image|>
         let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
-        // Insert image tokens only for the LAST user message — the one
-        // that actually has the attached image. Older user messages in
+        let audioBlock = "<|audio>" + String(repeating: "<|audio|>", count: audioNumTokens) + "<audio|>"
+        // Insert media tokens only for the LAST user message — the one
+        // that actually has the attached media. Older user messages in
         // multi-turn conversations are text-only.
         let lastUserIdx = messages.lastIndex { $0.role == .user }
         for (i, m) in messages.enumerated() {
             if m.role == .user {
-                if hasImage && i == lastUserIdx {
-                    p += "<|turn>user\n\(imageBlock)\n\(m.content)<turn|>\n"
+                let isLast = i == lastUserIdx
+                var mediaPrefix = ""
+                if hasImage && isLast { mediaPrefix += imageBlock + "\n" }
+                if hasAudio && isLast { mediaPrefix += audioBlock + "\n" }
+                if !mediaPrefix.isEmpty {
+                    p += "<|turn>user\n\(mediaPrefix)\(m.content)<turn|>\n"
                 } else {
                     p += "<|turn>user\n\(m.content)<turn|>\n"
                 }

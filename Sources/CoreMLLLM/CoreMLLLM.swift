@@ -30,6 +30,14 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
 
+    // Audio (lazy loaded to save memory)
+    private var audioModel: MLModel?
+    private var audioModelURL: URL?
+    private var audioConfig: MLModelConfiguration?
+    private var melFilterbank: [Float]?
+    private var audioMelFrames: Int = 200
+    private var audioNumTokens: Int = 50
+
     private init(config: ModelConfig, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
@@ -95,20 +103,53 @@ public final class CoreMLLLM: @unchecked Sendable {
             llm.visionConfig = cfg
         }
 
+        // Audio model (optional, lazy loaded on first audio)
+        let audioCompiled = directory.appendingPathComponent("audio.mlmodelc")
+        let audioPkg = directory.appendingPathComponent("audio.mlpackage")
+        if FileManager.default.fileExists(atPath: audioCompiled.path) {
+            llm.audioModelURL = audioCompiled
+        } else if FileManager.default.fileExists(atPath: audioPkg.path) {
+            llm.audioModelURL = audioPkg
+        }
+        if llm.audioModelURL != nil {
+            let cfg = MLModelConfiguration()
+            cfg.computeUnits = .cpuAndGPU
+            llm.audioConfig = cfg
+
+            // Load mel filterbank
+            let melURL = directory.appendingPathComponent("mel_filterbank.bin")
+            if FileManager.default.fileExists(atPath: melURL.path) {
+                llm.melFilterbank = try? AudioProcessor.loadMelFilterbank(from: melURL)
+            }
+
+            // Load audio config for frame/token counts
+            let audioConfURL = directory.appendingPathComponent("audio_config.json")
+            if let data = try? Data(contentsOf: audioConfURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                llm.audioMelFrames = json["mel_frames"] as? Int ?? 200
+                llm.audioNumTokens = json["num_tokens"] as? Int ?? 50
+            }
+        }
+
         return llm
     }
 
     /// Whether this model supports image input.
     public var supportsVision: Bool { visionModelURL != nil }
 
+    /// Whether this model supports audio input.
+    public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil }
+
     /// Model name from config.
     public var modelName: String { config.modelName }
 
     /// Generate a complete response.
     public func generate(_ prompt: String, image: CGImage? = nil,
+                         audio: [Float]? = nil,
                          maxTokens: Int = 256) async throws -> String {
         var result = ""
-        for await token in try await stream(prompt, image: image, maxTokens: maxTokens) {
+        for await token in try await stream(prompt, image: image, audio: audio,
+                                             maxTokens: maxTokens) {
             result += token
         }
         return result
@@ -116,8 +157,10 @@ public final class CoreMLLLM: @unchecked Sendable {
 
     /// Stream tokens as they're generated.
     public func stream(_ prompt: String, image: CGImage? = nil,
+                       audio: [Float]? = nil,
                        maxTokens: Int = 256) async throws -> AsyncStream<String> {
-        let chatPrompt = buildPrompt(prompt, hasImage: image != nil)
+        let chatPrompt = buildPrompt(prompt, hasImage: image != nil,
+                                     hasAudio: audio != nil)
         let tokenIDs = tokenizer.encode(text: chatPrompt)
 
         var imageFeatures: MLMultiArray?
@@ -125,20 +168,50 @@ public final class CoreMLLLM: @unchecked Sendable {
             imageFeatures = try processImage(image)
         }
 
+        var audioFeatures: MLMultiArray?
+        if let audio {
+            audioFeatures = try processAudio(audio)
+        }
+
         reset()
 
         let mutableSelf = self
-        let features = imageFeatures
+        let imgFeats = imageFeatures
+        let audFeats = audioFeatures
         let tokens = tokenIDs
+        let audTokenCount = mutableSelf.audioNumTokens
 
         return AsyncStream { continuation in
             Task {
                 do {
                     let IMAGE_TOKEN_ID = 258880
+                    let AUDIO_TOKEN_ID = 258881
                     var imageIdx = 0
+                    var audioIdx = 0
                     var nextID = 0
 
-                    if let engine = mutableSelf.chunkedEngine {
+                    // Helper: resolve multimodal embedding for a token
+                    func multimodalEmbedding(for tid: Int) -> MLMultiArray? {
+                        if tid == IMAGE_TOKEN_ID, let f = imgFeats, imageIdx < 256 {
+                            let emb = engine?.sliceFeature(f, at: imageIdx)
+                                ?? ImageProcessor.sliceFeature(f, at: imageIdx,
+                                    hiddenSize: mutableSelf.config.hiddenSize)
+                            imageIdx += 1
+                            return emb
+                        }
+                        if tid == AUDIO_TOKEN_ID, let f = audFeats, audioIdx < audTokenCount {
+                            let emb = engine?.sliceFeature(f, at: audioIdx)
+                                ?? AudioProcessor.sliceFeature(f, at: audioIdx,
+                                    hiddenSize: mutableSelf.config.hiddenSize)
+                            audioIdx += 1
+                            return emb
+                        }
+                        return nil
+                    }
+
+                    let engine = mutableSelf.chunkedEngine
+
+                    if let engine {
                         // Chunked path: hybrid prefill + decode
                         let prefillLen = min(tokens.count, engine.prefillN)
                         let useHybrid = engine.hasPrefill && prefillLen > 0
@@ -146,21 +219,21 @@ public final class CoreMLLLM: @unchecked Sendable {
                         if useHybrid {
                             try autoreleasepool {
                                 let batch = Array(tokens[0..<prefillLen])
+                                // Prefill with image features (audio uses per-token path)
                                 nextID = try engine.runPrefill(tokenIDs: batch,
-                                                               imageFeatures: features)
+                                                               imageFeatures: imgFeats)
                             }
                             imageIdx = tokens[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
+                            audioIdx = tokens[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count
                             engine.currentPosition = prefillLen
 
                             // Per-token decode for remaining prompt tokens
                             for step in prefillLen..<tokens.count {
                                 let tid = tokens[step]
                                 try autoreleasepool {
-                                    if tid == IMAGE_TOKEN_ID, let feats = features, imageIdx < 256 {
-                                        let imgEmb = engine.sliceFeature(feats, at: imageIdx)
+                                    if let emb = multimodalEmbedding(for: tid) {
                                         nextID = try engine.predictStep(tokenID: 0, position: step,
-                                                                         imageEmbedding: imgEmb)
-                                        imageIdx += 1
+                                                                         imageEmbedding: emb)
                                     } else {
                                         nextID = try engine.predictStep(tokenID: tid, position: step)
                                     }
@@ -170,11 +243,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                         } else {
                             for (step, tid) in tokens.enumerated() {
                                 try autoreleasepool {
-                                    if tid == IMAGE_TOKEN_ID, let feats = features, imageIdx < 256 {
-                                        let imgEmb = engine.sliceFeature(feats, at: imageIdx)
+                                    if let emb = multimodalEmbedding(for: tid) {
                                         nextID = try engine.predictStep(tokenID: 0, position: step,
-                                                                         imageEmbedding: imgEmb)
-                                        imageIdx += 1
+                                                                         imageEmbedding: emb)
                                     } else {
                                         nextID = try engine.predictStep(tokenID: tid, position: step)
                                     }
@@ -199,12 +270,9 @@ public final class CoreMLLLM: @unchecked Sendable {
                     } else {
                         // Monolithic path
                         for (step, tid) in tokens.enumerated() {
-                            if tid == IMAGE_TOKEN_ID, let feats = features, imageIdx < 256 {
-                                let imgEmb = ImageProcessor.sliceFeature(feats, at: imageIdx,
-                                    hiddenSize: mutableSelf.config.hiddenSize)
+                            if let emb = multimodalEmbedding(for: tid) {
                                 nextID = try mutableSelf.predictMonolithic(
-                                    tokenID: 0, position: step, imageEmbedding: imgEmb)
-                                imageIdx += 1
+                                    tokenID: 0, position: step, imageEmbedding: emb)
                             } else {
                                 nextID = try mutableSelf.predictMonolithic(
                                     tokenID: tid, position: step)
@@ -296,17 +364,36 @@ public final class CoreMLLLM: @unchecked Sendable {
         return try ImageProcessor.process(image, with: vm)
     }
 
+    // MARK: - Private: audio
+
+    private func processAudio(_ samples: [Float]) throws -> MLMultiArray {
+        if audioModel == nil, let url = audioModelURL, let cfg = audioConfig {
+            audioModel = try MLModel(contentsOf: url, configuration: cfg)
+        }
+        guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
+        guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
+        return try AudioProcessor.process(samples, with: am,
+                                           melFilterbank: mel,
+                                           targetFrames: audioMelFrames)
+    }
+
     // MARK: - Private: prompt building
 
-    private func buildPrompt(_ text: String, hasImage: Bool) -> String {
+    private func buildPrompt(_ text: String, hasImage: Bool,
+                              hasAudio: Bool = false) -> String {
         if config.architecture.hasPrefix("qwen") {
             return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n\(text)<|im_end|>\n<|im_start|>assistant\n"
         }
+        var mediaPrefix = ""
         if hasImage {
             let imageTokens = String(repeating: "<|image|>", count: 256)
-            return "<bos><|turn>user\n<|image>\(imageTokens)<image|>\n\(text)<turn|>\n<|turn>model\n"
+            mediaPrefix += "<|image>\(imageTokens)<image|>\n"
         }
-        return "<bos><|turn>user\n\(text)<turn|>\n<|turn>model\n"
+        if hasAudio {
+            let audioTokens = String(repeating: "<|audio|>", count: audioNumTokens)
+            mediaPrefix += "<|audio>\(audioTokens)<audio|>\n"
+        }
+        return "<bos><|turn>user\n\(mediaPrefix)\(text)<turn|>\n<|turn>model\n"
     }
 }
 
@@ -318,6 +405,7 @@ public enum CoreMLLLMError: LocalizedError {
     case modelNotFound(String)
     case prefillNotAvailable
     case visionNotAvailable
+    case audioNotAvailable
 
     public var errorDescription: String? {
         switch self {
@@ -326,6 +414,7 @@ public enum CoreMLLLMError: LocalizedError {
         case .modelNotFound(let name): return "Model file not found: \(name)"
         case .prefillNotAvailable: return "Prefill chunks not loaded"
         case .visionNotAvailable: return "Vision model not available"
+        case .audioNotAvailable: return "Audio model not available"
         }
     }
 }
