@@ -1223,10 +1223,17 @@ final class LLMRunner {
         return sign | UInt16(exp) << 10 | frac
     }
 
-    // MARK: - Helpers
+    // MARK: - Helpers (preallocated masks to avoid alloc per token)
+
+    private var causalMaskFull: MLMultiArray?
+    private var causalMaskSliding: MLMultiArray?
+    private var updateMaskBuf: MLMultiArray?
 
     private func makeCausalMask(position: Int, contextLength: Int) throws -> MLMultiArray {
-        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: contextLength)], dataType: .float16)
+        if causalMaskFull == nil {
+            causalMaskFull = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: contextLength)], dataType: .float16)
+        }
+        let mask = causalMaskFull!
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
         for i in 0..<contextLength { mp[i] = i <= position ? 0 : 0xFC00 }
         return mask
@@ -1234,20 +1241,29 @@ final class LLMRunner {
 
     /// Lookup per-layer raw embedding (already scaled by per_layer_embed_scale).
     /// Shape: (1, 1, num_layers * per_layer_dim).
+    // Preallocated buffer for per-layer raw embedding (avoids alloc per token)
+    private var plRawBuffer: MLMultiArray?
+
     private func lookupPerLayerRaw(tokenID: Int) throws -> MLMultiArray {
         guard let embedPerLayer else { throw NSError(domain: "LLMRunner", code: 5) }
         let totalDim = 35 * perLayerDim
-        let result = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+        if plRawBuffer == nil {
+            plRawBuffer = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+        }
+        let result = plRawBuffer!
         let raw = embedPerLayer.lookupRaw(tokenID)
         let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: totalDim)
-        for i in 0..<totalDim { dst[i] = raw[i] }
+        memcpy(dst, raw, totalDim * MemoryLayout<UInt16>.stride)
         return result
     }
 
     /// Sliding window causal mask: shape (1, 1, 1, W).
     /// Last min(position+1, W) slots are valid (cache end holds newest).
     private func makeSlidingCausalMask(position: Int, W: Int) throws -> MLMultiArray {
-        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        if causalMaskSliding == nil {
+            causalMaskSliding = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        }
+        let mask = causalMaskSliding!
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: W)
         let valid = min(position + 1, W)
         let start = W - valid
@@ -1256,10 +1272,12 @@ final class LLMRunner {
     }
 
     private func makeUpdateMask(position: Int, contextLength: Int) throws -> MLMultiArray {
-        let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), 1], dataType: .float16)
+        if updateMaskBuf == nil {
+            updateMaskBuf = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), 1], dataType: .float16)
+        }
+        let umask = updateMaskBuf!
         let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
         memset(up, 0, contextLength * MemoryLayout<UInt16>.stride)
-        // Clamp to last valid position if overflow (generation will stop shortly)
         let clamped = min(position, contextLength - 1)
         up[clamped] = 0x3C00
         return umask
