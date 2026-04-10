@@ -10,8 +10,14 @@ struct ChatView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
+    @State private var debugButtonTaps = 0
 
     var body: some View {
+        let _ = print("[UI] body re-evaluated, isLoaded=\(runner.isLoaded), isGenerating=\(runner.isGenerating), showModelPicker=\(showModelPicker), tapCount=\(debugButtonTaps)")
+        return _body
+    }
+
+    private var _body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 if !runner.isLoaded {
@@ -80,7 +86,9 @@ struct ChatView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(runner.isLoaded ? "Switch" : "Get Model") {
+                    Button(runner.isLoaded ? "Switch" : "Get Model (\(debugButtonTaps))") {
+                        debugButtonTaps += 1
+                        print("[UI] Get Model tapped, count=\(debugButtonTaps), showModelPicker -> true")
                         showModelPicker = true
                     }
                     .disabled(runner.isGenerating)
