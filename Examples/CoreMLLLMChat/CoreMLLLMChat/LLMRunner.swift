@@ -51,6 +51,9 @@ final class LLMRunner {
     private var visionModelURL: URL?
     private var visionConfig: MLModelConfiguration?
 
+    // Root folder of the currently loaded model (for MLComputePlan inspection).
+    private var modelFolderURL: URL?
+
     // External embeddings (for chunked model without embedded vocab tables)
     private var embedTokens: EmbeddingLookup?
     private var embedPerLayer: EmbeddingLookup?
@@ -87,6 +90,7 @@ final class LLMRunner {
 
     func loadModel(from url: URL) async throws {
         let folder = url.deletingLastPathComponent()
+        modelFolderURL = folder
 
         // Config
         loadingStatus = "Reading config..."
@@ -1322,5 +1326,104 @@ final class LLMRunner {
             } else if m.role == .assistant { p += "<|turn>model\n\(m.content)<turn|>\n" }
         }
         return p + "<|turn>model\n"
+    }
+
+    // MARK: - ANE placement verification
+    //
+    // Uses MLComputePlan (iOS 17+) to ask the CoreML runtime which compute
+    // device it will actually dispatch each op to — Neural Engine, GPU, or CPU.
+    // This is the ground truth for "is this model running on ANE?", and is
+    // much more reliable than watching Instruments energy graphs.
+    //
+    // We run it against every chunk that's on disk (decode + prefill + vision)
+    // and aggregate the counts. Result looks like:
+    //
+    //   chunk1       : 412/418 ANE (98%)  6 CPU
+    //   chunk2       : 389/395 ANE (98%)  6 CPU
+    //   ...
+    //   TOTAL        : 3210/3280 ANE (97%)  70 CPU
+
+    @available(iOS 17.0, *)
+    func verifyANEPlacement() async -> String {
+        guard let folder = modelFolderURL else {
+            return "No model folder (load a model first)."
+        }
+
+        // Match how we load them so the plan reflects runtime decisions.
+        let cfg = MLModelConfiguration()
+        cfg.computeUnits = .cpuAndNeuralEngine
+
+        let visionCfg = MLModelConfiguration()
+        visionCfg.computeUnits = .cpuAndGPU
+
+        struct Entry {
+            let label: String
+            let url: URL
+            let cfg: MLModelConfiguration
+        }
+        var entries: [Entry] = []
+        let chunkNames = [
+            "chunk1", "chunk2", "chunk3", "chunk4",
+            "prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4",
+        ]
+        for name in chunkNames {
+            if let u = findModel(in: folder, name: name) {
+                entries.append(Entry(label: name, url: u, cfg: cfg))
+            }
+        }
+        if let vurl = visionModelURL {
+            entries.append(Entry(label: "vision", url: vurl, cfg: visionCfg))
+        }
+
+        if entries.isEmpty {
+            return "No chunks found under \(folder.lastPathComponent)."
+        }
+
+        var lines: [String] = []
+        lines.append("MLComputePlan placement (preferred device per op):")
+        var tAll = 0, aAll = 0, gAll = 0, cAll = 0
+        for e in entries {
+            do {
+                let plan = try await MLComputePlan.load(contentsOf: e.url, configuration: e.cfg)
+                let (total, ane, gpu, cpu) = countOps(plan: plan)
+                tAll += total; aAll += ane; gAll += gpu; cAll += cpu
+                let pct = total > 0 ? Int((Double(ane) / Double(total) * 100.0).rounded()) : 0
+                let label = e.label.padding(toLength: 16, withPad: " ", startingAt: 0)
+                lines.append("  \(label) \(ane)/\(total) ANE (\(pct)%)  \(gpu) GPU  \(cpu) CPU")
+            } catch {
+                lines.append("  \(e.label): failed — \(error.localizedDescription)")
+            }
+        }
+        let pctAll = tAll > 0 ? Int((Double(aAll) / Double(tAll) * 100.0).rounded()) : 0
+        lines.append("  ----")
+        lines.append("  TOTAL            \(aAll)/\(tAll) ANE (\(pctAll)%)  \(gAll) GPU  \(cAll) CPU")
+        return lines.joined(separator: "\n")
+    }
+
+    @available(iOS 17.0, *)
+    private func countOps(plan: MLComputePlan) -> (total: Int, ane: Int, gpu: Int, cpu: Int) {
+        guard case let .program(program) = plan.modelStructure,
+              let main = program.functions["main"] else {
+            return (0, 0, 0, 0)
+        }
+        var total = 0, ane = 0, gpu = 0, cpu = 0
+        var stack: [MLModelStructure.Program.Block] = [main.block]
+        while let block = stack.popLast() {
+            for op in block.operations {
+                total += 1
+                if let usage = plan.deviceUsage(for: op) {
+                    switch usage.preferred {
+                    case .neuralEngine: ane += 1
+                    case .gpu:          gpu += 1
+                    case .cpu:          cpu += 1
+                    @unknown default:   break
+                    }
+                }
+                for nested in op.blocks {
+                    stack.append(nested)
+                }
+            }
+        }
+        return (total, ane, gpu, cpu)
     }
 }

@@ -110,6 +110,12 @@ struct ChatView: View {
                         .disabled(runner.isGenerating)
                     }
                 }
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("ANE?") { verifyANE() }
+                            .disabled(runner.isGenerating)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Clear") {
                         messages.removeAll()
@@ -212,6 +218,23 @@ struct ChatView: View {
                 }
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    private func verifyANE() {
+        messages.append(ChatMessage(role: .system, content: "Checking MLComputePlan device placement..."))
+        Task.detached(priority: .userInitiated) {
+            if #available(iOS 17.0, *) {
+                let report = await runner.verifyANEPlacement()
+                print(report)
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system, content: report))
+                }
+            } else {
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system, content: "MLComputePlan requires iOS 17+."))
+                }
             }
         }
     }
