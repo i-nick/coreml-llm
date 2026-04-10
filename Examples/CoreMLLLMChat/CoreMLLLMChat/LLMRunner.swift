@@ -1313,11 +1313,17 @@ final class LLMRunner {
         // states which it tries to interpret → garbled output.
         // For a single square image: <|image> + <|image|> * 256 + <image|>
         let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
-        for m in messages {
+        // Insert image tokens only for the LAST user message — the one
+        // that actually has the attached image. Older user messages in
+        // multi-turn conversations are text-only.
+        let lastUserIdx = messages.lastIndex { $0.role == .user }
+        for (i, m) in messages.enumerated() {
             if m.role == .user {
-                if hasImage {
+                if hasImage && i == lastUserIdx {
                     p += "<|turn>user\n\(imageBlock)\n\(m.content)<turn|>\n"
-                } else { p += "<|turn>user\n\(m.content)<turn|>\n" }
+                } else {
+                    p += "<|turn>user\n\(m.content)<turn|>\n"
+                }
             } else if m.role == .assistant { p += "<|turn>model\n\(m.content)<turn|>\n" }
         }
         return p + "<|turn>model\n"
