@@ -4,7 +4,7 @@
 
 CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a good fit for always-on, battery-friendly inference. [MLX Swift](https://github.com/ml-explore/mlx-swift) is the best choice when you want maximum throughput from the GPU; CoreML-LLM is the answer when you want the LLM to live on the ANE so the GPU stays free.
 
-> **v0.4.0** — Multimodal image understanding, PLE corruption fix, memory diagnostics. See [What's new](#whats-new-in-v040).
+> **v0.5.0** — 31 tok/s decode (+11%), 154 tok/s prefill (+60%), IOSurface KV cache, vectorized embeddings. See [What's new](#whats-new-in-v050).
 
 | Text | Multimodal |
 |------|------------|
@@ -12,14 +12,14 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
-| | v0.1.0 | v0.2.0 | v0.3.0 | **v0.4.0** |
-|---|---:|---:|---:|---:|
-| Context length | 512 | 2048 | 2048 | **2048** |
-| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | **~28 tok/s** |
-| Prefill (40 tokens) | ~3.6 s | ~220 ms | ~415 ms | **~415 ms (96 tok/s)** |
-| Multimodal (image) | — | — | broken | **working** |
-| ANE placement | — | — | 99.78% | **99.78%** |
-| Memory (`phys_footprint`) | — | — | — | **~1 GB** |
+| | v0.1.0 | v0.2.0 | v0.3.0 | v0.4.0 | **v0.5.0** |
+|---|---:|---:|---:|---:|---:|
+| Context length | 512 | 2048 | 2048 | 2048 | **2048** |
+| Decode speed | ~11 tok/s | ~11 tok/s | ~28 tok/s | ~28 tok/s | **~31 tok/s** |
+| Prefill | ~11 tok/s | ~175 tok/s | ~96 tok/s | ~96 tok/s | **~154 tok/s** |
+| Multimodal (image) | — | — | broken | working | **working** |
+| ANE placement | — | — | 99.78% | 99.78% | **99.78%** |
+| Memory (`phys_footprint`) | — | — | — | ~1 GB | **~1 GB** |
 
 Ground-truth ANE placement measured via `MLComputePlan` (7,294 / 7,310 dispatched LLM ops on ANE). Vision encoder runs on GPU by design.
 
@@ -50,7 +50,7 @@ The app uses `.cpuAndNeuralEngine` to force ANE execution.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.4.0"),
+    .package(url: "https://github.com/john-rocky/CoreML-LLM", from: "0.5.0"),
 ]
 ```
 
@@ -88,6 +88,21 @@ python convert.py --model gemma4-e2b --output ./output/gemma4-e2b
 # List available models
 python convert.py --list
 ```
+
+## What's new in v0.5.0
+
+### Decode +11%, Prefill +60%
+Two optimizations that required no model changes — pure Swift-side improvements:
+
+1. **Vectorized embedding lookup** — Replaced scalar INT8→FP16 dequantization loop (10,496 iterations per token) with Accelerate SIMD pipeline: `vDSP.convertElements` → `vDSP.multiply` → `vImageConvert_PlanarFtoPlanar16F`. Embedding time dropped from 2.0ms to 0.4ms per token. Prefill benefits even more since it processes hundreds of embeddings per call.
+
+2. **IOSurface-backed KV cache** — SWA KV cache buffers use IOSurface-backed `CVPixelBuffer` + `MLMultiArray(pixelBuffer:shape:)` for zero-copy CPU↔ANE data transfer.
+
+### Parallel chunk loading
+All 8 model chunks (4 decode + 4 prefill) load concurrently via `withThrowingTaskGroup`. First-run ANE compilation is pipelined across chunks.
+
+### Research documentation
+New [docs/RESEARCH.md](docs/RESEARCH.md) with comprehensive mobile LLM competitive analysis, ANE hardware internals, and optimization findings.
 
 ## What's new in v0.4.0
 
