@@ -7,12 +7,14 @@ final class AudioRecorder {
     var isRecording = false
     var duration: TimeInterval = 0
 
+    /// Recorded samples, set when recording finishes (auto-stop or manual stop).
+    var recordedSamples: [Float]?
+
     private var engine: AVAudioEngine?
     private var samples: [Float] = []
-    private var timer: Timer?
     private let sampleRate: Double = 16000
 
-    /// Maximum recording duration in seconds (model supports ~2 sec).
+    /// Maximum recording duration in seconds.
     let maxDuration: TimeInterval = 2.0
 
     /// Start recording from the microphone.
@@ -25,6 +27,7 @@ final class AudioRecorder {
 
         samples = []
         duration = 0
+        recordedSamples = nil
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
@@ -38,12 +41,11 @@ final class AudioRecorder {
             interleaved: false
         ) else { return }
 
-        // Install a converter tap
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else { return }
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) {
             [weak self] buffer, _ in
-            guard let self else { return }
+            guard let self, self.isRecording else { return }
 
             let frameCount = AVAudioFrameCount(
                 Double(buffer.frameLength) * self.sampleRate / inputFormat.sampleRate)
@@ -59,13 +61,12 @@ final class AudioRecorder {
             guard status != .error, let channelData = convertedBuffer.floatChannelData else { return }
 
             let count = Int(convertedBuffer.frameLength)
-            let ptr = channelData[0]
-            let newSamples = Array(UnsafeBufferPointer(start: ptr, count: count))
+            let newSamples = Array(UnsafeBufferPointer(start: channelData[0], count: count))
             DispatchQueue.main.async {
                 self.samples.append(contentsOf: newSamples)
                 self.duration = Double(self.samples.count) / self.sampleRate
                 if self.duration >= self.maxDuration {
-                    _ = self.stop()
+                    self.stop()
                 }
             }
         }
@@ -75,18 +76,22 @@ final class AudioRecorder {
         isRecording = true
     }
 
-    /// Stop recording and return captured samples.
-    func stop() -> [Float] {
+    /// Stop recording. Samples are stored in `recordedSamples`.
+    func stop() {
+        guard isRecording else { return }
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         isRecording = false
-        timer?.invalidate()
-        timer = nil
 
-        // Truncate to maxDuration
         let maxSamples = Int(maxDuration * sampleRate)
-        let result = Array(samples.prefix(maxSamples))
-        return result
+        recordedSamples = Array(samples.prefix(maxSamples))
+    }
+
+    /// Clear recorded audio.
+    func clear() {
+        recordedSamples = nil
+        samples = []
+        duration = 0
     }
 }

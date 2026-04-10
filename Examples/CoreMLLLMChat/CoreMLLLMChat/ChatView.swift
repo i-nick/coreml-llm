@@ -13,7 +13,6 @@ struct ChatView: View {
 
     // Audio recording
     @State private var audioRecorder = AudioRecorder()
-    @State private var recordedAudio: [Float]?
 
     // Battery benchmark state
     @State private var benchmarkRunning = false
@@ -95,7 +94,7 @@ struct ChatView: View {
                 }
 
                 // Audio preview
-                if recordedAudio != nil || audioRecorder.isRecording {
+                if audioRecorder.recordedSamples != nil || audioRecorder.isRecording {
                     HStack {
                         Image(systemName: "waveform")
                             .foregroundStyle(.purple)
@@ -104,11 +103,11 @@ struct ChatView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
                             Text(String(format: "Audio ready (%.1fs)",
-                                        Double(recordedAudio?.count ?? 0) / 16000.0))
+                                        Double(audioRecorder.recordedSamples?.count ?? 0) / 16000.0))
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         if !audioRecorder.isRecording {
-                            Button { recordedAudio = nil } label: {
+                            Button { audioRecorder.clear() } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .foregroundStyle(.secondary)
                             }
@@ -229,7 +228,8 @@ struct ChatView: View {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
             }
-            .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            .disabled((inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && audioRecorder.recordedSamples == nil)
                        || !runner.isLoaded || runner.isGenerating)
         }
         .padding()
@@ -262,21 +262,25 @@ struct ChatView: View {
     }
 
     private func sendMessage() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let audio = audioRecorder.recordedSamples
+
+        // Allow audio-only sends with a default prompt
+        if text.isEmpty && audio != nil {
+            text = "What do you hear in this audio?"
+        }
         guard !text.isEmpty else { return }
 
         let attachedImageData = selectedImageData
-        let hasAudioAttachment = recordedAudio != nil
         var content = text
-        if hasAudioAttachment { content = "[Audio] " + text }
+        if audio != nil { content = "[Audio] " + text }
         messages.append(ChatMessage(role: .user, content: content, imageData: attachedImageData))
         inputText = ""
         streamingText = ""
 
         let image = selectedImage
-        let audio = recordedAudio
         clearImage()
-        recordedAudio = nil
+        audioRecorder.clear()
 
         Task {
             do {
@@ -297,7 +301,7 @@ struct ChatView: View {
 
     private func toggleRecording() {
         if audioRecorder.isRecording {
-            recordedAudio = audioRecorder.stop()
+            audioRecorder.stop()
         } else {
             do {
                 try audioRecorder.start()
