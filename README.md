@@ -6,9 +6,9 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 > **v0.3.0** — Correct prefill (fp16 overflow fix), ~2.5× faster decode, N=512 batched prefill, 99.78% ops on ANE verified via `MLComputePlan`. See [What's new](#whats-new-in-v030).
 
-<video src="https://github.com/user-attachments/assets/4f749080-eef1-4728-a2e9-4784afb44e80" width="360"></video>
+![demo](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a)
 
-## Performance (Gemma 4 E2B, iPhone 15 Pro)
+## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
 | | v0.1.0 | v0.2.0 | **v0.3.0** |
 |---|---:|---:|---:|
@@ -19,7 +19,7 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 | ANE placement (dispatched ops) | — | — | **99.78%** |
 | Compute unit | ANE | ANE | ANE |
 
-Ground-truth ANE placement measured on iPhone 15 Pro via `MLComputePlan` (7,294 of 7,310 dispatched LLM ops on ANE; the remaining 16 CPU ops are the tail argmax in chunk4 / prefill_chunk4). Vision encoder runs on GPU by design.
+Ground-truth ANE placement measured on iPhone 17 Pro via `MLComputePlan` (7,294 of 7,310 dispatched LLM ops on ANE; the remaining 16 CPU ops are the tail argmax in chunk4 / prefill_chunk4). Vision encoder runs on GPU by design.
 
 > **Power draw:** we don't publish a specific wattage yet. iOS's public `batteryLevel` API is too coarse (~5% granularity) for a clean short-run measurement. What we can say: the device stays at `ProcessInfo.thermalState == .fair` through 10 minutes of sustained generation, so the draw is clearly modest — but a specific number will wait until we have a USB-C power meter or 24h Settings → Battery data.
 
@@ -93,13 +93,13 @@ Fix: reverted to manual attention (`matmul → add → softmax → matmul`) with
 Verified on Mac against the HuggingFace reference implementation, and on iPhone against `MLComputePlan`.
 
 ### Decode ~2.5× faster
-As a side effect of the prefill fix and the associated chunk rebuild, decode went from ~11 tok/s to **~28 tok/s** on iPhone 15 Pro, sustained over a 10-minute benchmark run.
+As a side effect of the prefill fix and the associated chunk rebuild, decode went from ~11 tok/s to **~28 tok/s** on iPhone 17 Pro, sustained over a 10-minute benchmark run.
 
 ### Prefill window 64 → 512
 The batched prefill path now covers the first 512 tokens in a single CoreML call (was 64). Multimodal prompts (≈ 280 image placeholders + surrounding text) now fit in a single prefill pass instead of falling back to per-token decode.
 
 ### ANE placement verification (`MLComputePlan`)
-New "ANE?" debug button in the sample app calls `MLComputePlan.load(contentsOf:)` for every loaded chunk and walks `MLModelStructure.Program.Block.operations`, bucketing each op by its preferred `MLComputeDevice`. On iPhone 15 Pro the LLM chunks report **7,294 / 7,310 dispatched ops on the ANE (99.78%)**; the 16 CPU ops are the tail argmax in `chunk4` / `prefill_chunk4`.
+New "ANE?" debug button in the sample app calls `MLComputePlan.load(contentsOf:)` for every loaded chunk and walks `MLModelStructure.Program.Block.operations`, bucketing each op by its preferred `MLComputeDevice`. On iPhone 17 Pro the LLM chunks report **7,294 / 7,310 dispatched ops on the ANE (99.78%)**; the 16 CPU ops are the tail argmax in `chunk4` / `prefill_chunk4`.
 
 The denominator excludes `constexpr_affine_dequantize` / `constexpr_lut_to_dense` (INT4 palette expansion) and other compile-time ops that `deviceUsage(for:)` correctly reports as `nil` — those don't dispatch at runtime and shouldn't appear in "X% on ANE".
 
