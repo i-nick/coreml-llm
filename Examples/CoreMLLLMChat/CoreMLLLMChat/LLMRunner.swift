@@ -68,6 +68,9 @@ final class LLMRunner {
     private var cosFullTable: Data?     // (max_len, 512) float16
     private var sinFullTable: Data?
 
+    // Cached image features (persist across turns until Clear)
+    private var cachedImageFeatures: MLMultiArray?
+
     // Shared
     private var tokenizer: (any Tokenizer)?
     private var contextLength = 512
@@ -363,20 +366,23 @@ final class LLMRunner {
         }
 
         isGenerating = true
-        let prompt = buildPrompt(messages: messages, hasImage: image != nil)
-        let tokenIDs = tokenizer!.encode(text: prompt)
 
-        var imageFeatures: MLMultiArray?
+        // Process new image if provided, otherwise reuse cached features.
+        var imageFeatures: MLMultiArray? = cachedImageFeatures
         if let image {
-            // Lazy-load vision model on first use
             if visionModel == nil, let url = visionModelURL, let cfg = visionConfig {
                 loadingStatus = "Loading vision model..."
                 visionModel = try MLModel(contentsOf: url, configuration: cfg)
             }
             if let vm = visionModel {
                 imageFeatures = try processImage(image, with: vm)
+                cachedImageFeatures = imageFeatures
             }
         }
+
+        let hasImage = imageFeatures != nil
+        let prompt = buildPrompt(messages: messages, hasImage: hasImage)
+        let tokenIDs = tokenizer!.encode(text: prompt)
 
         resetConversation()
 
@@ -493,6 +499,7 @@ final class LLMRunner {
             state = model?.makeState()
         }
         currentPosition = 0
+        cachedImageFeatures = nil
     }
 
     // MARK: - Prediction (dispatches to monolithic or chunked)
