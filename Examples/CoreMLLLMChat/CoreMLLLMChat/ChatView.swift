@@ -13,11 +13,6 @@ struct ChatView: View {
     @State private var debugButtonTaps = 0
 
     var body: some View {
-        let _ = print("[UI] body re-evaluated, isLoaded=\(runner.isLoaded), isGenerating=\(runner.isGenerating), showModelPicker=\(showModelPicker), tapCount=\(debugButtonTaps)")
-        return _body
-    }
-
-    private var _body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 if !runner.isLoaded {
