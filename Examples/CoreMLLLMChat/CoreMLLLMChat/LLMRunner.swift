@@ -1360,6 +1360,7 @@ final class LLMRunner {
         var batteryEnd: Float
         var thermalStart: ProcessInfo.ThermalState
         var thermalEnd: ProcessInfo.ThermalState
+        var abortedThermal: Bool = false
 
         var batteryDelta: Float { batteryStart - batteryEnd }  // positive = drained
         var drainedPercent: Double { Double(batteryDelta) * 100.0 }
@@ -1384,9 +1385,19 @@ final class LLMRunner {
 
         var totalTokens = 0
         var round = 0
+        var abortedThermal = false
         let prompt = ChatMessage(role: .user, content: Self.benchmarkPrompt)
 
+        // Safety: if the device reaches .serious thermal state (iOS has
+        // already started aggressive throttling and the case is probably
+        // >40 °C), we stop immediately. .critical means stop no matter what.
+        func isThermalUnsafe() -> Bool {
+            let s = ProcessInfo.processInfo.thermalState
+            return s == .serious || s == .critical
+        }
+
         while Date().timeIntervalSince(startTime) < duration {
+            if isThermalUnsafe() { abortedThermal = true; break }
             round += 1
             // AsyncStream of decoded chunks — count by fragment, close to
             // token count (decode() can occasionally emit multi-token chunks
@@ -1408,7 +1419,9 @@ final class LLMRunner {
                     onProgress(prog)
                 }
                 if elapsed >= duration { break }
+                if isThermalUnsafe() { abortedThermal = true; break }
             }
+            if abortedThermal { break }
             if Date().timeIntervalSince(startTime) >= duration { break }
         }
 
@@ -1424,7 +1437,8 @@ final class LLMRunner {
             batteryStart: startBat,
             batteryEnd: endBat,
             thermalStart: startThermal,
-            thermalEnd: endThermal
+            thermalEnd: endThermal,
+            abortedThermal: abortedThermal
         )
     }
 
