@@ -429,6 +429,10 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "audio.mlmodelc/analytics/coremldata.bin", localPath: "audio.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
             .init(remotePath: "mel_filterbank.bin", localPath: "mel_filterbank.bin", estimatedSize: 131_584),
             .init(remotePath: "audio_config.json", localPath: "audio_config.json", estimatedSize: 500),
+            // Audio projection weights (Swift-side float32 computation)
+            .init(remotePath: "output_proj_weight.npy", localPath: "output_proj_weight.npy", estimatedSize: 3_145_856),
+            .init(remotePath: "output_proj_bias.npy", localPath: "output_proj_bias.npy", estimatedSize: 3_200),
+            .init(remotePath: "embed_proj_weight.npy", localPath: "embed_proj_weight.npy", estimatedSize: 4_718_720),
         ]
 
         pendingFiles = files
