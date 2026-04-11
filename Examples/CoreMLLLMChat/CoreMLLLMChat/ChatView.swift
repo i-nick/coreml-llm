@@ -164,6 +164,12 @@ struct ChatView: View {
                         .disabled(runner.isGenerating || benchmarkRunning)
                     }
                 }
+                if runner.hasAudio {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Test") { runAudioTest() }
+                            .disabled(runner.isGenerating)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Clear") {
                         messages.removeAll()
@@ -417,6 +423,44 @@ struct ChatView: View {
         selectedPhoto = nil
         selectedImage = nil
         selectedImageData = nil
+    }
+
+    /// Load test_audio.pcm from Documents and run through audio pipeline.
+    /// Compare with HF reference to verify on-device accuracy.
+    private func runAudioTest() {
+        messages.append(ChatMessage(role: .system, content: "Running audio test (5.8s C-major chord)..."))
+        Task {
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let pcmURL = docs.appendingPathComponent("test_audio.pcm")
+            guard let data = try? Data(contentsOf: pcmURL) else {
+                messages.append(ChatMessage(role: .system, content: "test_audio.pcm not found in Documents"))
+                return
+            }
+            let count = data.count / MemoryLayout<Float>.stride
+            var samples = [Float](repeating: 0, count: count)
+            data.withUnsafeBytes { raw in
+                let src = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+                for i in 0..<count { samples[i] = src[i] }
+            }
+            messages.append(ChatMessage(role: .system, content: "Loaded \(count) samples (\(String(format: "%.1f", Double(count)/16000))s)"))
+
+            do {
+                let stream = try await runner.generate(
+                    messages: [ChatMessage(role: .user, content: "What do you hear in this audio?")],
+                    audio: samples)
+                var response = ""
+                for await token in stream { response += token }
+                if !response.isEmpty {
+                    messages.append(ChatMessage(role: .assistant, content: response))
+                    // HF reference for this exact audio:
+                    // "The audio appears to contain a melodic sound, possibly a musical instrument or vocalization."
+                    messages.append(ChatMessage(role: .system,
+                        content: "HF reference: \"The audio appears to contain a melodic sound, possibly a musical instrument or vocalization.\""))
+                }
+            } catch {
+                messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
+            }
+        }
     }
 }
 
