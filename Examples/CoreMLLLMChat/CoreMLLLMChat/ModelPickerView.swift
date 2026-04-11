@@ -84,6 +84,8 @@ struct ModelRow: View {
     let onCancel: () -> Void
     let onDelete: () -> Void
 
+    @State private var showDeleteConfirm = false
+
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
@@ -107,7 +109,7 @@ struct ModelRow: View {
                     Button("Load") { onLoad() }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                    Button(role: .destructive) { onDelete() } label: {
+                    Button(role: .destructive) { showDeleteConfirm = true } label: {
                         Image(systemName: "trash")
                     }
                     .controlSize(.small)
@@ -146,5 +148,10 @@ struct ModelRow: View {
             }
         }
         .padding(.vertical, 4)
+        .confirmationDialog("Delete \(model.name)?", isPresented: $showDeleteConfirm) {
+            Button("Delete", role: .destructive) { onDelete() }
+        } message: {
+            Text("Downloaded model files will be removed.")
+        }
     }
 }
