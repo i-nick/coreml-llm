@@ -122,8 +122,10 @@ public final class ModelDownloader: NSObject {
         return nil
     }
 
-    public func download(_ model: ModelInfo) async throws -> URL {
-        if let existing = localModelURL(for: model) { return existing }
+    /// Download a model, skipping files that already exist on disk.
+    /// Set `repair: true` to re-check and download any missing files.
+    public func download(_ model: ModelInfo, repair: Bool = false) async throws -> URL {
+        if !repair, let existing = localModelURL(for: model) { return existing }
 
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.main.async { [self] in
