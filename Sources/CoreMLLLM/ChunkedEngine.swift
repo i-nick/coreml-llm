@@ -167,24 +167,27 @@ final class ChunkedEngine {
             }
         }
 
-        // Auto-detect context length from model's K_full_in shape
-        // to prevent mismatch between model_config.json and actual model
-        var detectedCtx = config.contextLength
-        if let desc = c1.modelDescription.inputDescriptionsByName["K_full_in"],
-           let constraint = desc.multiArrayConstraint {
-            let shape = constraint.shape
-            if shape.count >= 3 { detectedCtx = shape[2].intValue }
-        }
+        // Auto-detect context length: use minimum across all chunks
+        // to handle mixed 2K/8K model files gracefully
         var effectiveConfig = config
-        if detectedCtx != config.contextLength {
-            print("[ChunkedEngine] WARNING: model_config says ctx=\(config.contextLength) but model expects ctx=\(detectedCtx). Using model shape.")
-            effectiveConfig.contextLength = detectedCtx
+        var minCtx = config.contextLength
+        for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
+            if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
+               let c = desc.multiArrayConstraint,
+               let last = c.shape.last?.intValue, last < minCtx {
+                print("[ChunkedEngine] \(label) causal_mask_full expects \(last), config says \(config.contextLength)")
+                minCtx = last
+            }
+        }
+        if minCtx != config.contextLength {
+            print("[ChunkedEngine] Clamping context to \(minCtx). Delete model and re-download for full context.")
+            effectiveConfig.contextLength = minCtx
         }
 
         // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
         let ctx = effectiveConfig.contextLength
-        let W = effectiveConfig.slidingWindow
+        let W = config.slidingWindow
         func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
             let height = slots * 1 * seqLen
@@ -213,7 +216,7 @@ final class ChunkedEngine {
             memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
-        print("[KV] Allocating IOSurface-backed KV cache buffers")
+        print("[KV] Allocating IOSurface-backed KV cache buffers (ctx=\(ctx))")
 
         return try ChunkedEngine(
             chunk1: c1, chunk2: c2, chunk3: c3, chunk4: c4,

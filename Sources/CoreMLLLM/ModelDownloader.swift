@@ -389,7 +389,7 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
-        let sdpaPrefix = "sdpa/"
+        let sdpaPrefix = "sdpa-8k/"
 
         func mlc(_ sub: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
             [.init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/weights/weight.bin",
