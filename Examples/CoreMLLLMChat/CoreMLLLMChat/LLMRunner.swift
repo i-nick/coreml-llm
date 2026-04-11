@@ -42,6 +42,7 @@ final class LLMRunner {
         maxAudioDuration = llm!.maxAudioDuration
         isLoaded = true
         loadingStatus = "Ready"
+        print("[LLMRunner] loaded: vision=\(hasVision) audio=\(hasAudio) model=\(modelName)")
     }
 
     // MARK: - Generation

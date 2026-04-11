@@ -268,18 +268,21 @@ final class ChunkedEngine {
 
     // MARK: - Single-token decode step
 
+    // Profiling accumulators
+    private var profileEmbed: Double = 0
+    private var profilePredict: Double = 0
+    private var profileCount: Int = 0
+
     func predictStep(tokenID: Int, position: Int,
                      imageEmbedding: MLMultiArray? = nil) throws -> Int {
         let ctx = config.contextLength
         let W = config.slidingWindow
         let hidden = config.hiddenSize
 
+        let t0 = CFAbsoluteTimeGetCurrent()
         let hiddenIn: MLMultiArray
         let plRaw: MLMultiArray
         if let imageEmbedding {
-            // Image token: use vision features as hidden state, ZERO per-layer raw.
-            // PLE projection from hidden_states is done inside chunk1 (on ANE).
-            // Adding non-zero per_layer_raw from PAD/IMAGE token IDs corrupts PLE.
             hiddenIn = imageEmbedding
             let totalDim = config.numLayers * config.perLayerDim
             plRaw = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
@@ -288,6 +291,8 @@ final class ChunkedEngine {
             hiddenIn = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hidden)])
             plRaw = try lookupPerLayerRaw(tokenID: tokenID)
         }
+        let t1 = CFAbsoluteTimeGetCurrent()
+        profileEmbed += (t1 - t0)
 
         let maskFull = try makeCausalMask(position: position, length: ctx)
         let maskSliding = try makeSlidingCausalMask(position: position, W: W)
@@ -361,6 +366,17 @@ final class ChunkedEngine {
         // Chunk 4
         var d4 = shared; d4["hidden_states"] = MLFeatureValue(multiArray: h3)
         let out4 = try chunk4.prediction(from: MLDictionaryFeatureProvider(dictionary: d4))
+
+        profilePredict += (CFAbsoluteTimeGetCurrent() - t1)
+        profileCount += 1
+        if profileCount % 10 == 0 {
+            let n = Double(profileCount)
+            let eMs = profileEmbed / n * 1000
+            let pMs = profilePredict / n * 1000
+            print(String(format: "[Profile] emb=%.1fms predict=%.1fms total=%.1fms (%.1f tok/s)",
+                         eMs, pMs, eMs + pMs, 1000.0 / (eMs + pMs)))
+        }
+
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
