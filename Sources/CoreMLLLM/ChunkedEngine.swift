@@ -167,10 +167,24 @@ final class ChunkedEngine {
             }
         }
 
+        // Auto-detect context length from model's K_full_in shape
+        // to prevent mismatch between model_config.json and actual model
+        var detectedCtx = config.contextLength
+        if let desc = c1.modelDescription.inputDescriptionsByName["K_full_in"],
+           let constraint = desc.multiArrayConstraint {
+            let shape = constraint.shape
+            if shape.count >= 3 { detectedCtx = shape[2].intValue }
+        }
+        var effectiveConfig = config
+        if detectedCtx != config.contextLength {
+            print("[ChunkedEngine] WARNING: model_config says ctx=\(config.contextLength) but model expects ctx=\(detectedCtx). Using model shape.")
+            effectiveConfig.contextLength = detectedCtx
+        }
+
         // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
-        let ctx = config.contextLength
-        let W = config.slidingWindow
+        let ctx = effectiveConfig.contextLength
+        let W = effectiveConfig.slidingWindow
         func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
             let height = slots * 1 * seqLen
@@ -212,7 +226,7 @@ final class ChunkedEngine {
             kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
-            config: config, prefillN: prefillN)
+            config: effectiveConfig, prefillN: prefillN)
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,
