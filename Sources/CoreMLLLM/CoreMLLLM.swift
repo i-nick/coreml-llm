@@ -47,8 +47,8 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var audioModelURL: URL?
     private var audioConfig: MLModelConfiguration?
     private var melFilterbank: [Float]?
-    private var audioMelFrames: Int = 200
-    private var audioNumTokens: Int = 50
+    public private(set) var audioMelFrames: Int = 200
+    public private(set) var audioNumTokens: Int = 50
 
     // Multi-turn: cache image features across turns
     private var cachedImageFeatures: MLMultiArray?
@@ -180,6 +180,13 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// Whether this model supports audio input.
     public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil }
 
+    /// Maximum audio duration in seconds that the model accepts.
+    public var maxAudioDuration: TimeInterval {
+        // mel_frames ≈ audio_samples / (hop_length * 4) → seconds = mel_frames * hop_length * 4 / sample_rate
+        // Simplified: each mel frame ≈ 10ms, 4x subsample → each token ≈ 40ms
+        Double(audioMelFrames) * 0.01
+    }
+
     /// Model name from config.
     public var modelName: String { config.modelName }
 
@@ -293,10 +300,12 @@ public final class CoreMLLLM: @unchecked Sendable {
                         if useHybrid {
                             try autoreleasepool {
                                 let batch = Array(tokens[0..<prefillLen])
-                                nextID = try engine.runPrefill(tokenIDs: batch,
-                                                               imageFeatures: imgFeats,
-                                                               audioFeatures: audFeats,
-                                                               audioNumTokens: audTokenCount)
+                                nextID = try engine.runPrefill(
+                                    tokenIDs: batch,
+                                    imageFeatures: imgFeats,
+                                    audioFeatures: audFeats,
+                                    audioNumTokens: audTokenCount
+                                )
                             }
                             imageIdx = tokens[0..<prefillLen].filter { $0 == IMAGE_TOKEN_ID }.count
                             audioIdx = tokens[0..<prefillLen].filter { $0 == AUDIO_TOKEN_ID }.count

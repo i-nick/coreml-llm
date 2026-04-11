@@ -15,7 +15,7 @@ final class AudioRecorder {
     private let sampleRate: Double = 16000
 
     /// Maximum recording duration in seconds.
-    let maxDuration: TimeInterval = 2.0
+    var maxDuration: TimeInterval = 10.0
 
     /// Start recording from the microphone.
     func start() throws {

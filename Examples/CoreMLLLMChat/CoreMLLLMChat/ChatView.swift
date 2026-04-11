@@ -305,6 +305,7 @@ struct ChatView: View {
         if audioRecorder.isRecording {
             audioRecorder.stop()
         } else {
+            audioRecorder.maxDuration = runner.maxAudioDuration
             do {
                 try audioRecorder.start()
             } catch {

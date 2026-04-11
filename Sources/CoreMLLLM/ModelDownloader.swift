@@ -53,7 +53,7 @@ public final class ModelDownloader: NSObject {
         }
 
         public static let defaults: [ModelInfo] = [
-            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.7 GB",
+            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.8 GB",
                       downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
                       folderName: "gemma4-e2b"),
             ModelInfo(id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
@@ -416,8 +416,8 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "vision.mlmodelc/model.mil", localPath: "vision.mlmodelc/model.mil", estimatedSize: 50_000),
             .init(remotePath: "vision.mlmodelc/metadata.json", localPath: "vision.mlmodelc/metadata.json", estimatedSize: 1_000),
             .init(remotePath: "vision.mlmodelc/analytics/coremldata.bin", localPath: "vision.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            // Audio encoder (Conformer 12-layer, INT4)
-            .init(remotePath: "audio.mlmodelc/weights/weight.bin", localPath: "audio.mlmodelc/weights/weight.bin", estimatedSize: 148_063_168),
+            // Audio encoder (Conformer 12-layer, INT8)
+            .init(remotePath: "audio.mlmodelc/weights/weight.bin", localPath: "audio.mlmodelc/weights/weight.bin", estimatedSize: 295_373_248),
             .init(remotePath: "audio.mlmodelc/coremldata.bin", localPath: "audio.mlmodelc/coremldata.bin", estimatedSize: 1_000),
             .init(remotePath: "audio.mlmodelc/model.mil", localPath: "audio.mlmodelc/model.mil", estimatedSize: 759_000),
             .init(remotePath: "audio.mlmodelc/metadata.json", localPath: "audio.mlmodelc/metadata.json", estimatedSize: 3_000),
