@@ -175,7 +175,10 @@ class TraceableAudioTower(nn.Module):
 
         # Encoder output
         self.output_proj = audio.output_proj
-        self.embed_norm = hf_model.model.embed_audio.embedding_pre_projection_norm
+        # Fix: CoreML GPU runtime produces all-zeros for RMSNorm with_scale=False.
+        # Replace with cat([x,-x]) → LayerNorm trick that CoreML handles correctly.
+        self.embed_norm_dim = hf_model.model.embed_audio.embedding_projection.in_features
+        self.embed_norm_eps = hf_model.model.embed_audio.embedding_pre_projection_norm.eps
         self.embed_proj = hf_model.model.embed_audio.embedding_projection
 
         self.num_layers = cfg.num_hidden_layers
@@ -270,9 +273,9 @@ class TraceableAudioTower(nn.Module):
             hidden_states = self.norm_outs[i](hidden_states)
 
         # Output projection + embed_audio
-        hidden_states = self.output_proj(hidden_states)
-        hidden_states = self.embed_norm(hidden_states)
-        hidden_states = self.embed_proj(hidden_states)
+        # output_proj + embed_audio are computed in Swift/Accelerate (float32)
+        # because CoreML GPU runtime corrupts the RMSNorm(with_scale=False).
+        # The CoreML model outputs raw hidden_states from the last Conformer layer.
         return hidden_states
 
 
@@ -282,13 +285,18 @@ def verify_output(hf_model, wrapper, mel_frames: int) -> float:
         torch.manual_seed(42)
         dummy = torch.randn(1, mel_frames, 128, dtype=torch.float16)
 
-        # HF reference (fp16)
+        # HF reference: raw Conformer hidden (before output_proj)
+        # HF audio_tower includes output_proj, so we hook to get pre-proj hidden
+        pre_proj = [None]
+        def hook(mod, inp, out):
+            pre_proj[0] = inp[0] if isinstance(inp, tuple) else inp
+        h = hf_model.model.audio_tower.output_proj.register_forward_hook(hook)
         audio_out = hf_model.model.audio_tower(
             dummy, attention_mask=None, return_dict=True)
-        hf_features = hf_model.model.embed_audio(
-            inputs_embeds=audio_out.last_hidden_state)
+        h.remove()
+        hf_features = pre_proj[0]
 
-        # Our wrapper (float32)
+        # Our wrapper (float32) — now outputs hidden_states only
         wrapper_features = wrapper(dummy.float())
 
         diff = (hf_features.float() - wrapper_features.float()).abs()
@@ -358,10 +366,17 @@ def main():
             ),
         ],
         outputs=[
-            ct.TensorType(name="audio_features", dtype=np.float16),
+            ct.TensorType(name="hidden_states", dtype=np.float16),
         ],
         minimum_deployment_target=ct.target.iOS18,
-        compute_precision=ct.precision.FLOAT16,
+        # Mixed precision: keep numerically sensitive ops in float32,
+        # everything else in fp16. Fixes tanh softcap + RMSNorm precision.
+        compute_precision=ct.transform.FP16ComputePrecision(
+            op_selector=lambda op: op.op_type not in {
+                "tanh", "softmax", "reduce_mean", "pow", "sqrt",
+                "reduce_sum", "l2_norm",
+            }
+        ),
         compute_units=ct.ComputeUnit.ALL,
     )
 
@@ -419,11 +434,25 @@ def main():
         json.dump(audio_config, f, indent=2)
     print(f"  Saved {config_path}")
 
+    # Export projection weights for Swift-side computation
+    # (CoreML GPU runtime corrupts RMSNorm with_scale=False)
+    print("\nExporting projection weights...")
+    op = hf_model.model.audio_tower.output_proj
+    ep = hf_model.model.embed_audio.embedding_projection
+    np.save(os.path.join(args.output, "output_proj_weight.npy"),
+            op.weight.data.cpu().half().numpy())  # (1536, 1024)
+    np.save(os.path.join(args.output, "output_proj_bias.npy"),
+            op.bias.data.cpu().half().numpy())     # (1536,)
+    np.save(os.path.join(args.output, "embed_proj_weight.npy"),
+            ep.weight.data.cpu().half().numpy())   # (1536, 1536)
+    print(f"  output_proj: ({op.in_features}→{op.out_features}), embed_proj: ({ep.in_features}→{ep.out_features})")
+
     print(f"\nAudio conversion complete!")
-    print(f"  Model:  {path} ({size_mb:.1f} MB)")
-    print(f"  Config: {config_path}")
-    print(f"  Input:  (1, {args.mel_frames}, 128) mel → "
-          f"Output: (1, {seq_len}, 1536) features")
+    print(f"  Model:   {path} ({size_mb:.1f} MB)")
+    print(f"  Weights: output_proj_weight/bias.npy, embed_proj_weight.npy")
+    print(f"  Config:  {config_path}")
+    print(f"  Input:   (1, {args.mel_frames}, 128) mel → "
+          f"Output: (1, {seq_len}, 1024) hidden → Swift projection → (1, {seq_len}, 1536) features")
 
 
 if __name__ == "__main__":

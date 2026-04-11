@@ -47,6 +47,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     private var audioModelURL: URL?
     private var audioConfig: MLModelConfiguration?
     private var melFilterbank: [Float]?
+    private var audioProjection: AudioProcessor.ProjectionWeights?
     public private(set) var audioMelFrames: Int = 200
     public private(set) var audioNumTokens: Int = 50
 
@@ -87,15 +88,22 @@ public final class CoreMLLLM: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - directory: Folder containing model files, embeddings, config
+    ///   - contextLength: Override context length (nil = use model default).
+    ///     SWA models scale efficiently: only full-attention layers (7/35)
+    ///     grow with context. 8K→16K costs ~75 MB extra, 8K→32K ~150 MB.
     ///   - computeUnits: CoreML compute units (default: `.cpuAndNeuralEngine`)
     ///   - onProgress: Optional callback for loading status updates
     public static func load(
         from directory: URL,
+        contextLength: Int? = nil,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
         onProgress?("Reading config...")
-        let config = try ModelConfig.load(from: directory)
+        var config = try ModelConfig.load(from: directory)
+        if let contextLength {
+            config.contextLength = contextLength
+        }
 
         // Tokenizer
         onProgress?("Loading tokenizer...")
@@ -161,6 +169,11 @@ public final class CoreMLLLM: @unchecked Sendable {
             if FileManager.default.fileExists(atPath: melURL.path) {
                 llm.melFilterbank = try? AudioProcessor.loadMelFilterbank(from: melURL)
             }
+            // Projection weights (Swift-side float32 computation)
+            let projURL = directory.appendingPathComponent("output_proj_weight.npy")
+            if FileManager.default.fileExists(atPath: projURL.path) {
+                llm.audioProjection = try? AudioProcessor.ProjectionWeights.load(from: directory)
+            }
 
             let audioConfURL = directory.appendingPathComponent("audio_config.json")
             if let data = try? Data(contentsOf: audioConfURL),
@@ -183,6 +196,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     /// If the model is already downloaded, skips straight to loading.
     public static func load(
         model: ModelDownloader.ModelInfo,
+        contextLength: Int? = nil,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
         onProgress: ((String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
@@ -195,14 +209,15 @@ public final class CoreMLLLM: @unchecked Sendable {
             modelURL = try await downloader.download(model)
         }
         let directory = modelURL.deletingLastPathComponent()
-        return try await load(from: directory, computeUnits: computeUnits, onProgress: onProgress)
+        return try await load(from: directory, contextLength: contextLength,
+                               computeUnits: computeUnits, onProgress: onProgress)
     }
 
     /// Whether this model supports image input.
     public var supportsVision: Bool { visionModelURL != nil }
 
     /// Whether this model supports audio input.
-    public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil }
+    public var supportsAudio: Bool { audioModelURL != nil && melFilterbank != nil && audioProjection != nil }
 
     /// Maximum audio duration in seconds that the model accepts.
     public var maxAudioDuration: TimeInterval {
@@ -506,6 +521,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
         guard let am = audioModel else { throw CoreMLLLMError.audioNotAvailable }
         guard let mel = melFilterbank else { throw CoreMLLLMError.audioNotAvailable }
+        guard let proj = audioProjection else { throw CoreMLLLMError.audioNotAvailable }
 
         // Compute actual mel frames from audio length (matching HF Gemma4AudioFeatureExtractor)
         let padLeft = 160  // frameLength / 2, semicausal pad
@@ -518,7 +534,8 @@ public final class CoreMLLLM: @unchecked Sendable {
 
         let features = try AudioProcessor.process(samples, with: am,
                                                     melFilterbank: mel,
-                                                    targetFrames: audioMelFrames)
+                                                    targetFrames: audioMelFrames,
+                                                    projection: proj)
         return (features, actualTokens)
     }
 
