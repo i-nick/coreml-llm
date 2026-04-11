@@ -112,6 +112,7 @@ struct ModelRow: View {
                     Button(role: .destructive) { showDeleteConfirm = true } label: {
                         Image(systemName: "trash")
                     }
+                    .buttonStyle(.borderless)
                     .controlSize(.small)
                 }
             } else if isDownloading {
@@ -142,6 +143,7 @@ struct ModelRow: View {
                         Button(role: .destructive) { onDelete() } label: {
                             Image(systemName: "trash")
                         }
+                        .buttonStyle(.borderless)
                         .controlSize(.small)
                     }
                 }
