@@ -264,6 +264,9 @@ final class ChunkedEngine {
             memset(buf.dataPointer, 0, buf.count * MemoryLayout<UInt16>.stride)
         }
         currentPosition = 0
+        profileEmbed = 0
+        profilePredict = 0
+        profileCount = 0
     }
 
     // MARK: - Single-token decode step
@@ -631,7 +634,7 @@ final class ChunkedEngine {
             // Adding per_layer_raw from IMAGE_TOKEN_ID corrupts PLE with nonsense.
             if tid == IMAGE_TOKEN_ID || tid == 258881 { continue }  // image/audio: zero PLE
             let raw = embedPerLayer.lookupRaw(tid)
-            for j in 0..<totalDim { dst[i * totalDim + j] = raw[j] }
+            memcpy(dst.advanced(by: i * totalDim), raw, totalDim * MemoryLayout<UInt16>.stride)
         }
         return arr
     }
