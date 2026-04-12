@@ -29,7 +29,7 @@ from models.gemma4 import Gemma4Model
 from models.gemma4_swa_chunks import SWAChunk1, SWAChunk2, SWAChunk3, SWAChunk4
 from ane_ops import MODEL_DTYPE, InModelArgmax
 
-HF_DIR = f"{ROOT}/output/gemma4-e2b-final/hf_model"
+HF_DIR = os.environ.get("GEMMA4_HF_DIR", f"{ROOT}/../output/gemma4-e2b/hf_model")
 CTX = 2048
 W = 512
 N_VERIFY = 4

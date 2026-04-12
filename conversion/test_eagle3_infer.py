@@ -68,8 +68,8 @@ def build_rope_cache(max_seq, head_dim, theta, device, dtype=torch.float32):
 def apply_rope(x, cos, sin):
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
+    cos = cos[None, None, :, :].to(x.dtype)
+    sin = sin[None, None, :, :].to(x.dtype)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
@@ -294,6 +294,7 @@ def main():
     missing, unexpected = draft.load_state_dict(sd, strict=False)
     if missing:    print(f"  missing keys:    {missing[:5]} (total {len(missing)})")
     if unexpected: print(f"  unexpected keys: {unexpected[:5]} (total {len(unexpected)})")
+    draft = draft.to(torch.float16)
     draft.eval()
     n = sum(p.numel() for p in draft.parameters())
     print(f"  draft params: {n/1e6:.1f}M")
