@@ -167,26 +167,24 @@ final class ChunkedEngine {
             }
         }
 
-        // Auto-detect context length: use minimum across all chunks
-        // to handle mixed 2K/8K model files gracefully
-        var effectiveConfig = config
-        var minCtx = config.contextLength
+        // Validate context length: every chunk must agree with model_config.json.
+        // Mixed 2K / 8K chunk files from different builds are rejected with a clear
+        // error so the user knows to re-download a consistent set.
+        let configuredCtx = config.contextLength
         for (label, model) in [("chunk1", c1!), ("chunk2", c2!), ("chunk3", c3!), ("chunk4", c4!)] {
             if let desc = model.modelDescription.inputDescriptionsByName["causal_mask_full"],
                let c = desc.multiArrayConstraint,
-               let last = c.shape.last?.intValue, last < minCtx {
-                print("[ChunkedEngine] \(label) causal_mask_full expects \(last), config says \(config.contextLength)")
-                minCtx = last
+               let last = c.shape.last?.intValue, last != configuredCtx {
+                throw CoreMLLLMError.modelNotFound(
+                    "\(label): causal_mask_full expects ctx=\(last) but model_config.json says " +
+                    "\(configuredCtx). Delete the model directory and re-download to get a " +
+                    "consistent set of chunks.")
             }
-        }
-        if minCtx != config.contextLength {
-            print("[ChunkedEngine] Clamping context to \(minCtx). Delete model and re-download for full context.")
-            effectiveConfig.contextLength = minCtx
         }
 
         // SWA KV buffers — IOSurface-backed for zero-copy CPU↔ANE transfer
         let maxHd = 512
-        let ctx = effectiveConfig.contextLength
+        let ctx = configuredCtx
         let W = config.slidingWindow
         func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let width = maxHd
@@ -229,7 +227,7 @@ final class ChunkedEngine {
             kFull1: ioSurfaceArray(slots: 1, seqLen: ctx), vFull1: ioSurfaceArray(slots: 1, seqLen: ctx),
             kSliding2: ioSurfaceArray(slots: 5, seqLen: W), vSliding2: ioSurfaceArray(slots: 5, seqLen: W),
             kFull2: ioSurfaceArray(slots: 2, seqLen: ctx), vFull2: ioSurfaceArray(slots: 2, seqLen: ctx),
-            config: effectiveConfig, prefillN: prefillN)
+            config: config, prefillN: prefillN)
     }
 
     private init(chunk1: MLModel, chunk2: MLModel, chunk3: MLModel, chunk4: MLModel,

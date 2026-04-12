@@ -115,10 +115,6 @@ public final class CoreMLLLM: @unchecked Sendable {
             onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
             llm.chunkedEngine = try await ChunkedEngine.load(
                 from: directory, config: config, computeUnits: computeUnits)
-            // Sync config in case ChunkedEngine clamped context length to match model
-            if let engineConfig = llm.chunkedEngine?.config, engineConfig.contextLength != config.contextLength {
-                llm.config = engineConfig
-            }
         } else {
             let mlConfig = MLModelConfiguration()
             mlConfig.computeUnits = computeUnits
