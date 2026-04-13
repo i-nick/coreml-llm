@@ -115,8 +115,8 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 |---|---|---|
 | Pre-alloc masks/RoPE | ✅ pure ANE | Swift-only buffer reuse, ANE graph unchanged |
 | KV-share Q-batching | ✅ pure ANE | Just widens matmul Q dim |
-| INT8 KV cache | ❌ measured no-op on ANE | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. Use full W8A8 instead. |
-| W8A8 | ✅ pure ANE | THE Apple-documented int8-int8 fast path |
+| INT8 KV cache | ❌ ANE-incompatible | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. |
+| W8A8 | ❌ ANE-incompatible | coremltools `linear_quantize_activations` emits MIL quant/dequant ops the iPhone ANE compiler rejects. See `docs/EXPERIMENTS.md`. |
 | DuoAttention | ✅ pure ANE | head classification offline; runtime uses 2 static KV banks |
 | EAGLE-3 draft + verify | ✅ pure ANE | small decoder layer, EnumeratedShapes for K=1/3 |
 | StreamingLLM + QLoRA | ✅ pure ANE (after FT) | standard attention post-fine-tune |
@@ -139,16 +139,19 @@ Stacked sequentially (each factor applies to the current baseline):
 ```
              step-speedup    cumulative tok/s @ 8K
 baseline                     15
-+ pre-alloc masks      ×1.07     16
-+ KV-share Q-batch     ×1.08     17
-+ W8A8 proper calib    ×1.40     24     ← opens int8-int8 ANE compute path
-+ DuoAttention (A1)    ×1.50     36     ← quality preserved, training-free
-+ EAGLE-3 (in train)   ×2.00     72     ← fully lossless via verify
++ pre-alloc masks      ×1.00     15     ← measured ~0% on 2K; mask-fill was already sub-ms
++ KV-share Q-batch     ×1.08     16
++ DuoAttention (A1)    ×1.50     24     ← quality preserved, training-free
++ EAGLE-3 (in train)   ×2.00     48     ← fully lossless via verify
 ```
 
-**INT8 KV / KIVI removed from the stack**: measured ineffective on ANE (CoreML dequantizes to FP16 before ANE compute). Only full W8A8 opens the int8-int8 fast path.
+**Pre-alloc** (PR #6) is kept as a cleanup, not a speedup — mask/RoPE prep wasn't on the hot path at 2K. May still help at 8K where masks are 4× larger; not re-measured.
 
-**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~50 tok/s @ 8K** is the realistic landing zone.
+**W8A8 removed from the stack**: coremltools `linear_quantize_activations` inserts MIL quant/dequant ops the iPhone ANE compiler rejects. See `docs/EXPERIMENTS.md` for the dead-end write-up.
+
+**INT8 KV / KIVI removed from the stack**: same ANE-compiler rejection as W8A8, plus CoreML dequantizes to FP16 before ANE compute. No int8-int8 fast path is reachable on ANE today.
+
+**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~34 tok/s @ 8K** is the realistic landing zone.
 
 Alternative path replacing EAGLE-3 with TriForce hierarchical:
 ```

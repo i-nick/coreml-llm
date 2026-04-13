@@ -1,177 +1,225 @@
 # EAGLE-3 Integration — Resumable Session State
 
-Working document for the ongoing EAGLE-3 integration on this MacBook Air (M3 16GB). Written so a new session can pick up from here without re-deriving context.
+Working document for the EAGLE-3 integration on MacBook Air (M3 16GB). Written so a new session can pick up without re-deriving context.
 
-**Last updated:** 2026-04-12. Branch: `feature/audio-support`.
+**Last updated:** 2026-04-13. Active branch: `feature/eagle3-speculative` (not merged to main). Status: **Phase 2A + 2B done, Phase 3 benched, speculative currently slower than baseline** — two independent blockers documented below.
+
+---
+
+## TL;DR — where we are
+
+| Phase | Status |
+|---|---|
+| Phase 1 — draft + fusion training | ✅ done on Colab. acc[0]=74.94%, acc[1]=40.6%, acc[2]=23.9% |
+| Phase 2A — verify chunks (T=3) | ✅ built + smoke-tested (PASS) + parity-validated in fp32 |
+| Phase 2B — Swift integration | ✅ scaffolded on `feature/eagle3-speculative` (Spec target protocol, mask/RoPE builders, public-API gating) |
+| Phase 3 — iPhone 17 Pro bench | ⚠️ ran, **not faster than baseline 28.6 tok/s** (11–17 tok/s with fallback to T=1) |
+
+Root cause for Phase 3 miss: **two independent blockers must be fixed together** (see §Blockers). Fixing only one does not help.
 
 ---
 
 ## Training artifacts (source of truth)
 
-| File | Path | Notes |
-|---|---|---|
-| `eagle3_draft_best.pt` | `/Users/daisukemajima/Downloads/eagle3_draft/` | 188MB, 47.2M params |
-| `eagle3_config.json` | same dir | `fusion_layers=[8,17,34]`, `hidden=1536`, `num_heads=8`, `num_kv_heads=1`, `head_dim=256`, `ffn=6144`, `embed_scale=39.1918...`, `ttt_k=3`, `model_id=google/gemma-4-E2B-it` |
-| `eagle3_eval.json` | same dir | **acc[0]=74.94%, acc[1]=40.6%, acc[2]=23.9%, expL=2.13** — well above §3.1 gates (≥55% / ≥2.0). Projection 30→63.8 tok/s. |
-| `eagle3_training.log` | same dir | 2 epochs × ~30k samples on Colab |
+All at `/Users/daisukemajima/Downloads/eagle3_draft/`:
 
-Use `best.pt`, not `step4000.pt` or `final.pt` — best has highest acc[0].
+| File | Notes |
+|---|---|
+| `eagle3_draft_best.pt` | 188 MB, 47.2 M params. Use `best.pt`, not `step4000.pt` / `final.pt` |
+| `eagle3_config.json` | `fusion_layers=[8,17,34]`, `hidden=1536`, `num_heads=8`, `num_kv_heads=1`, `head_dim=256`, `ffn=6144`, `embed_scale=39.1918...`, `ttt_k=3`, `model_id=google/gemma-4-E2B-it` |
+| `eagle3_eval.json` | acc[0]=0.7494, acc[1]=0.406, acc[2]=0.239, expL=2.13 — passes §3.1 gates |
 
 ---
 
-## Converted CoreML artifacts (ready for iPhone)
+## Converted CoreML artifacts (on disk)
 
 All under `/Users/daisukemajima/Downloads/CoreML-LLM/output/`:
 
-| File | Size | Outputs (incl. EAGLE-3 additions) | Built by |
-|---|---:|---|---|
-| `eagle3_draft.mlpackage` | 210MB | `h_out`, `token` (int32 scalar), `logit` (fp16) | `build_eagle3.py` |
-| `eagle3_fusion.mlpackage` | 14MB | `h_fused` | `build_eagle3.py` |
-| `eagle3-chunks/chunk1.mlpackage` | 149MB | (unchanged, no fusion layer) | `build_eagle3_chunks.py` |
-| `eagle3-chunks/chunk2.mlpackage` | 128MB | existing + **`hidden_at_L8` (1,1,1536) fp16** | `build_eagle3_chunks.py` |
-| `eagle3-chunks/chunk3.mlpackage` | 311MB | existing + **`hidden_at_L17` (1,1,1536) fp16** | `build_eagle3_chunks.py` |
-| `eagle3-chunks/chunk4.mlpackage` | 503MB | `token_id`, `token_logit`, **`hidden_at_L34`** (pre-norm, 1,1,1536 fp16) | `build_eagle3_chunks.py` |
+| File | Size | Notes |
+|---|---:|---|
+| `eagle3_draft.mlpackage` | 210 MB (INT4) or 838 MB (fp16) | both rebuilt during Phase 3 diagnosis |
+| `eagle3_fusion.mlpackage` | 14 MB fp16 | |
+| `eagle3-chunks/chunk{1..4}.mlpackage` | 149 / 128 / 311 / 503 MB | decode chunks with `hidden_at_L{8,17,34}` taps |
+| `eagle3-chunks/verify_chunk{1..4}.mlpackage` | 149 / 128 / 311 / 503 MB | T=3 verify chunks, INT4 palettized |
 
-All INT4 palettized (group_size=32). Output dtype 65552 = `MLMultiArrayDataType.float16`.
-
-Smoke-tested with `/tmp/smoke_eagle3_chunks.py`: all output names / shapes verified.
+Smoke tests:
+- `python /tmp/smoke_eagle3_chunks.py` — decode chunk I/O
+- `python /tmp/smoke_verify_chunks.py` — verify chunk I/O (last confirmed **PASS** 2026-04-13)
 
 ---
 
-## Environment gotchas (things that will bite if ignored)
+## Verify chunk I/O contract (T=3)
 
-### Python version
-- System Python 3.9.6 does **not** work with coremltools 8+/9+. Need 3.10-3.12.
-- Installed: `brew install python@3.11` → `/opt/homebrew/bin/python3.11` (Python 3.11.15).
+| chunk | inputs (+ shared mask/RoPE/PLE) | outputs |
+|---|---|---|
+| verify_chunk1 | `per_layer_raw` (1,T,35·256), `K/V_sliding_in` (7,1,W,512), `K/V_full_in` (1,1,ctx,512) | `hidden_states_out` (1,T,1536), `per_layer_combined_out` (1,T,8960) |
+| verify_chunk2 | `per_layer_combined`, `K/V_sliding_in` (5,…), `K/V_full_in` (2,…) | `hidden_states_out`, `kv13_k_out` (1,1,W+T=515,256), `kv13_v_out`, `kv14_k_out` (1,1,ctx+T=2051,512), `kv14_v_out` |
+| verify_chunk3 | `kv13_k`/v (1,1,W+T,256), `kv14_k`/v (1,1,ctx+T,512) | `hidden_states_out` (1,T,1536) |
+| verify_chunk4 | same as chunk3 | `token_ids` (T,) int32, `token_logits` (T,) fp16 |
 
-### Venv and pinned deps
-- `conversion/.venv/` is the active venv. Activate with `source conversion/.venv/bin/activate` from repo root.
-- `requirements.txt` pins `torch==2.11.0` but the monolithic path bug surfaces with `torch==2.7.0` too — the bug is not a torch version issue (see below).
-- `accelerate` is NOT in requirements.txt but is required by `transformers==5.5.0` when using `device_map`. Installed ad hoc: `pip install accelerate`.
+Design: read-only KV during verify; attention concats cache with newly-computed K/V (masks shape `(1,1,T,W+T)` / `(1,1,T,ctx+T)`). Swift commits accepted tokens by re-running T=1 decode per token (current impl; see blocker #2).
 
-### Current installed torch: 2.7.0
-Downgraded from 2.11 to try to fix convert.py (didn't help — bug is elsewhere). If you bump torch back up, verify `build_eagle3_chunks.py` still traces cleanly.
-
-### HF access
-- `google/gemma-4-E2B-it` is **not** gated (at time of writing) — anonymous DL works even without `HF_TOKEN`. The "unauthenticated requests" warning is cosmetic.
-- Gemma 4 model already cached at `~/.cache/huggingface/hub/models--google--gemma-4-E2B-it/` (~5.5GB) and copied to `output/gemma4-e2b/hf_model/` for `Gemma4Model.from_pretrained(HF_DIR)` to use.
-
-### convert.py is broken for Gemma 4 monolithic — **do not use**
-- Error: `gemma4_wrapper.py:107` passes (1,1,1536) hidden directly to a Conv2d(1536, 8960, 1) without the NCHW permute (`.permute(0,2,1).unsqueeze(2)`). Fails trace with "expected input[1, 1, 1, 1536] to have 1536 channels, but got 1".
-- **Not needed for EAGLE-3 work.** Use `build_eagle3_chunks.py` (bypasses the broken wrapper, uses `SWAChunk1-4` directly which have correct NCHW handling).
-- If someone wants to fix it: wrap hidden_states in `.permute(0,2,1).unsqueeze(2)` before the Conv2d, then `.squeeze(2).permute(0,2,1)` after.
-
-### test_eagle3_infer.py Mac-compat patches (already applied)
-1. `apply_rope` now casts cos/sin to `x.dtype` (was fp32, would break fp16 q/k).
-2. Draft cast to fp16 after loading (was fp32, target forward is fp16 → dtype mismatch on fusion).
-3. Pass `--device cpu` or `--device mps`. **MPS OOMs on M3 16GB** (9.54 GiB single alloc). Use `cpu` — slow but works for sanity.
-
-### Sanity check result (for reference)
-```
-[1/2] target-only greedy generation ... 1.11 tok/s
-[2/2] EAGLE-3 speculative (K=3) ....... 0.97 tok/s
-  draft accept rate: 33.3% of 3 proposals per step
-  outputs match: True    ← THIS IS THE GATE, not speedup (CPU is apples-to-oranges vs ANE)
-```
+Parity validated:
+- Layer-level fp16 — PASS (max abs diff ≤ 4e-3).
+- Chunk1 drill-through fp32 — PASS (1e-5).
+- E2E argmax fp32 random — PASS.
+- E2E argmax fp16 random — diverges, but this is rounding on `torch.randn` logits over 262K vocab (no top-1 separation). Real Gemma-4 logits are sharp enough. Not a bug.
 
 ---
 
-## Remaining work
+## Phase 3 bench — on-device measurements (iPhone 17 Pro)
 
-### Phase 2A — Verify chunks (N=3) — NOT STARTED
-Blocker: `_run_layer_swa` is hardcoded for T=1 (line 70 of `gemma4_swa_chunks.py`: `q.view(1, num_heads, hd, 1)` assumes T=1). Verify chunks need T=3 to batch-verify K=3 candidates.
+Thermally stable, 10-min bench. `[SpecDbg]` + per-call timing instrumentation on `SpeculativeLoop.drawBurst` + `ChunkedEngine.verifyCandidates/commitAccepted`:
 
-Two approaches:
-1. **Rewrite _run_layer_swa to handle variable T.** Cleanest but touches the core decode path — risk of regressing the shipped T=1 code.
-2. **Build verify chunks on top of `_run_layer_prefill`** (in `gemma4_prefill_chunks.py`) which already handles T>1 (used for batched prefill, N=64/512). Build with sample shapes N=3, keep K/V I/O explicit so Swift can discard rejected updates.
-
-Recommend **approach 2** (less risk).
-
-Files to create: `conversion/build_eagle3_verify.py`. Outputs:
-- `verify_chunk1.mlpackage` — SWAChunk1 at T=3
-- `verify_chunk2.mlpackage` — + `hidden_at_L8` at last position (or all 3 positions)
-- `verify_chunk3.mlpackage` — + `hidden_at_L17`
-- `verify_chunk4.mlpackage` — + `hidden_at_L34` (pre-norm), + `token_ids` per position (shape (1,3) int32)
-
-### Phase 2B — Swift integration in ChunkedEngine
-`SpeculativeLoop.swift` is already written (see file in Sources/CoreMLLLM/). It expects a `SpeculativeTarget`-conforming object. ChunkedEngine needs:
-
-1. **Store `hidden_at_L{8,17,34}`** after each decode step. Modify `decodeStep()` (ChunkedEngine.swift around line 340-386) to fetch these outputs from chunk2/3/4 and stash in 3 ivars.
-
-2. **Conform to `SpeculativeTarget`**:
-   ```swift
-   func lastHiddenMulti(at indices: [Int]) throws -> [MLMultiArray] {
-       // Match indices to lastHiddenAtL8 / L17 / L34
-   }
-   func commitAccepted(_ tokens: [Int32]) throws {
-       // For each token, run decodeStep(tokenID:) — advances position + updates KV
-       // Last iteration naturally refreshes the lastHiddenAtL* ivars
-   }
-   func verifyCandidates(_ candidates: [Int32], K: Int) throws -> [Int32] {
-       // Needs verify_chunk1..4 (Phase 2A).
-       // Until Phase 2A lands: throw SpeculativeError.verifyFailed("verify chunks not built")
-   }
-   ```
-
-3. **Make CoreMLLLM public API** decide when to use speculative (based on `SpeculativeLoop.shouldSpeculate` + rolling acceptance). See `SpeculativeLoop.swift:194`.
-
-### Phase 3 — iPhone deployment + bench
-1. Compile `.mlpackage` → `.mlmodelc` (either via Xcode "Add to target" or at runtime via `MLModel.compileModel(at:)`).
-2. Replace existing iPhone `chunk1/2/3/4.mlmodelc` with EAGLE-3 versions. Existing chunks lack `hidden_at_L*` outputs → would crash Swift that expects them, so this is an all-or-nothing swap.
-3. Bench on iPhone 17 Pro, thermal-stable 10-min, K=1 (baseline) vs K=3 (EAGLE-3). Target per docs/SPEED_8K.md §3 P1: ctx=2048 at 55-70 tok/s, ctx=8192 at ~30 tok/s.
+| Metric | Observed | Expected (Colab) |
+|---|---:|---:|
+| Baseline T=1 decode | 28.6 tok/s | — |
+| verify T=3 per call | 31.5 ms | — |
+| commit per token | 33–36 ms | — |
+| Avg accepted tokens / burst | **~2.0** (always exactly 2) | 3.05 |
+| Speculative eff throughput | 11–17 tok/s | target 40+ |
+| Rolling acceptance | decays to 0.30 within ~15 bursts → falls back to T=1 | 1.0 |
 
 ---
 
-## Command cheat sheet (Mac)
+## Blockers — both must be fixed for speculative to help
+
+### Blocker 1: draft/target distribution mismatch → ~0% acceptance
+
+`[SpecDbg]` dump showed draft proposals `[3768, 496, 496]` vs target argmax `[68158, 18114, 236772]` — zero overlap.
+
+Ruled out:
+- INT4 palettization degrading draft (fp16 draft gives same acc rate).
+- Draft outputting random / ID-mapped garbage (proposals track inputs meaningfully, just not matching target).
+
+Cross-check with Mac CPU `test_eagle3_infer.py` using HF Gemma 4 target + PyTorch draft:
+- Accept rate **42.9%** (below Colab 74.94% but well above on-device ~0%).
+
+Hidden-tap comparison HF vs our custom `Gemma4Model` on same prompt (chat-formatted through Swift's `buildGemmaPrompt`):
+- L8: 45% relative mean diff, norm similar.
+- L17: 33% rel diff, norm similar.
+- L34: **94% rel diff, HF norm 158 vs our 36 (4.4× magnitude gap)**.
+
+Argmax-chain generations diverge too: HF produces gibberish (`'    '`, `'**'`, `'Py'`) while our custom forward produces coherent haiku (`' leaves'`, `' sway'`, `'\n'`). So HF reference used at draft training time was either broken or a transformers-version mismatch has opened a gap.
+
+**Either way, the trained draft no longer matches the target we deploy → must retrain against our custom target.**
+
+### Blocker 2: `commitAccepted` re-runs T=1 decode per accepted token
+
+Even with a perfect draft, current implementation cannot beat baseline:
+
+| Implementation | Burst formula | @ avg N=3.05 | tok/s | vs baseline 28 |
+|---|---|---:|---:|---:|
+| Current (re-run decode) | 42 + 33N ms | 143 ms | 21.4 | **0.76× (slower)** |
+| K/V direct-write + 1 decode | 75 ms constant | 75 ms | 40.7 | **1.45×** |
+| K/V direct-write + Mirror v1 (draft→GPU) | ~69 ms | 69 ms | 44.2 | **1.58×** |
+| K/V direct-write + Mirror v2 (cross-burst pipeline) | ~60 ms | 60 ms | 50.8 | **1.82×** |
+
+**Fix**: Phase 2A v2 verify chunks (per-T-position K/V + hidden outputs) already exist in Python on `feature/eagle3-speculative`'s `gemma4_verify_chunks.py` / `build_eagle3_verify.py`. Not yet deployed to device. Swift KV-writer not yet implemented.
+
+---
+
+## How to resume work
+
+### Step 0: check out the right branch
 
 ```bash
-# Always start from repo root:
 cd /Users/daisukemajima/Downloads/CoreML-LLM
+git checkout feature/eagle3-speculative
 source conversion/.venv/bin/activate
+```
 
-# Sanity check (CPU, slow but validates match)
-python conversion/test_eagle3_infer.py \
-    --ckpt /Users/daisukemajima/Downloads/eagle3_draft/eagle3_draft_best.pt \
-    --prompt "The capital of Japan is" --max-new 16 --K 3 --device cpu
+All the Python conversion, Swift scaffolding, and diagnostic instrumentation live on this branch. It is NOT merged to main.
 
-# Rebuild fusion + draft mlpackages (≈3 min)
+### Step 1: validate current Mac artifacts
+
+```bash
+ls -la output/eagle3_*.mlpackage output/eagle3-chunks/*.mlpackage
+# Should show 2 + 8 mlpackages (decode + verify), total ≈2.4 GB
+python /tmp/smoke_eagle3_chunks.py   # decode chunks
+python /tmp/smoke_verify_chunks.py   # verify chunks
+```
+
+If either fails, rebuild:
+
+```bash
+# Decode chunks (~20 min)
+python conversion/build_eagle3_chunks.py --output ./output/eagle3-chunks
+
+# Verify chunks (~10 min, takes -T for arity, default 3)
+python conversion/build_eagle3_verify.py --output ./output/eagle3-chunks
+
+# Draft + fusion (~3 min)
 python conversion/build_eagle3.py \
     --ckpt /Users/daisukemajima/Downloads/eagle3_draft/eagle3_draft_best.pt \
     --output ./output/eagle3_draft.mlpackage \
     --fusion-output ./output/eagle3_fusion.mlpackage \
     --palettize-int4
-
-# Rebuild all 4 decode chunks (≈20 min total)
-python conversion/build_eagle3_chunks.py --output ./output/eagle3-chunks
-# Or one at a time: --only chunk2
-
-# Smoke-test output contracts
-python /tmp/smoke_eagle3_chunks.py
 ```
+
+### Step 2: pick which blocker to unblock first
+
+Order doesn't matter for correctness — both must be done before a speedup materializes. Suggested order based on effort:
+
+**2a. Unblock via retrain (Blocker 1)** — needs Colab or a bigger box:
+- Regenerate hidden-state corpus using our **custom** `Gemma4Model` (not HF) as the teacher. Files to touch:
+  - `conversion/collect_eagle_hidden_states.py` — swap `Gemma4ForConditionalGeneration` for our `Gemma4Model` forward.
+  - `conversion/train_eagle3_draft.ipynb` — same swap in the eval loop.
+- Retrain for 2 epochs × ~30k samples. Target: acc[0] ≥ 0.5 against custom target (below Colab's 0.75 is expected since custom forward's hiddens are less rich at L34).
+- Rebuild `eagle3_draft.mlpackage` from new `best.pt`.
+
+**2b. Unblock via K/V direct-write (Blocker 2)** — Mac + iPhone, more Swift work:
+- The v2 verify chunks (per-T-position K/V outputs) are already built in `gemma4_verify_chunks.py`. Rebuild if needed.
+- `ChunkedEngine.commitAccepted(_:)` currently replays `predictStep` per token. Rewrite to:
+  1. Accept verify's output K/V at the accepted-T prefix (not full T).
+  2. Write those slices into the IOSurface-backed sliding/full KV caches at the right positions.
+  3. Advance `self.position` by N without running decode chunks.
+- Last hidden (`hidden_at_L34` for the final accepted token) can be taken from verify_chunk4's `hidden_states_out[N-1]`, avoiding the final decode call too.
+
+### Step 3: deploy + bench
+
+Push the four compiled `.mlmodelc` via `xcrun devicectl device copy to` (same pattern as `/tmp/push_eagle3.sh`, which pushed the v1 bundle). Replace both decode chunks and verify chunks — the app expects the all-or-nothing EAGLE-3 bundle.
+
+Bench in `Examples/CoreMLLLMChat` at 10-minute thermal-stable steady state. Compare against baseline 28.6 tok/s. Target after both blockers fixed: ≥40 tok/s at 2K, ≥22 tok/s at 8K (baseline 8K = 14.5 tok/s).
 
 ---
 
-## Files I own in this work
+## Environment gotchas (things that will bite if ignored)
+
+- **Python**: system 3.9.6 does NOT work with coremltools 8+/9+. Use `/opt/homebrew/bin/python3.11` via `conversion/.venv/`.
+- **`accelerate`** is NOT in requirements.txt but needed by `transformers==5.5.0` with `device_map`. Install ad hoc: `pip install accelerate`.
+- **Current torch**: 2.7.0 (downgraded from 2.11 during monolithic-path debugging). `build_eagle3_chunks.py` / `build_eagle3_verify.py` trace cleanly at 2.7.0; bump cautiously.
+- **HF model cache**: `google/gemma-4-E2B-it` cached at `~/.cache/huggingface/hub/...`, copied to `output/gemma4-e2b/hf_model/` for `Gemma4Model.from_pretrained(HF_DIR)`. Model is NOT gated — anonymous DL works.
+- **`test_eagle3_infer.py`**: MPS OOMs on M3 16GB (9.54 GiB single alloc). Always use `--device cpu` for sanity tests.
+- **`convert.py` Gemma 4 monolithic path is BROKEN** — `gemma4_wrapper.py:107` misses an NCHW permute on the (1,1,1536) hidden. EAGLE-3 work does not touch this path. If fixing: wrap in `.permute(0,2,1).unsqueeze(2)` before Conv2d, reverse after.
+
+---
+
+## Files this work touches
 
 | File | What |
 |---|---|
-| `conversion/build_eagle3_chunks.py` | New — builds decode chunks with hidden taps |
-| `conversion/test_eagle3_infer.py` | Patched for Mac (apply_rope dtype, draft fp16 cast, HF_DIR fallback) |
-| `conversion/build_speculative.py` | Patched `HF_DIR` to env var / `../output/gemma4-e2b/hf_model` fallback |
+| `conversion/build_eagle3.py` | Builds draft + fusion mlpackages |
+| `conversion/build_eagle3_chunks.py` | Builds decode chunks with `hidden_at_L*` taps |
+| `conversion/build_eagle3_verify.py` | Builds T=3 verify chunks (v1 + v2 output variants) |
+| `conversion/models/gemma4_verify_chunks.py` | `_run_layer_verify` + `VerifyChunk1..4` |
+| `conversion/test_eagle3_infer.py` | Mac-compat patches (apply_rope dtype, draft fp16 cast, HF_DIR env fallback) |
+| `conversion/build_speculative.py` | Patched `HF_DIR` env var / output-dir fallback |
+| `Sources/CoreMLLLM/SpeculativeLoop.swift` | Pre-existing. Plus `[SpecDbg]` logging in first 3 bursts |
+| `Sources/CoreMLLLM/ChunkedEngine.swift` | `SpeculativeTarget` conformance, verify-mask builders, spec profile counters |
+| `Sources/CoreMLLLM/CoreMLLLM.swift` | Auto-loads verify chunks, `supportsSpeculative`, `speculativeAcceptance`, per-burst `[Spec] burst #N` stats |
 | `docs/EAGLE3_INTEGRATION_STATE.md` | This file |
-
-`SpeculativeLoop.swift` was already in place; unchanged in this session.
 
 ---
 
-## Quick validation to run first in a new session
+## First-thing-to-do on a fresh session
 
 ```bash
 cd /Users/daisukemajima/Downloads/CoreML-LLM
+git checkout feature/eagle3-speculative
 source conversion/.venv/bin/activate
 ls -la output/eagle3_*.mlpackage output/eagle3-chunks/*.mlpackage
-# Should show 2 + 4 mlpackages, total ≈1.4GB
-python /tmp/smoke_eagle3_chunks.py  # should print PASS
+python /tmp/smoke_verify_chunks.py   # PASS = Phase 2A artifacts intact
 ```
 
-If that passes, the Mac-side conversion work is intact and you can move to Phase 2A (verify chunks) or 2B (Swift).
+If PASS: Mac-side work is intact; go to Step 2 above. If FAIL: rebuild via Step 1.
