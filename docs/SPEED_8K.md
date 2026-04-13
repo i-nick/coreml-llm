@@ -1,8 +1,8 @@
 # 8K Context Speed — Exhaustive Research & Roadmap (v3)
 
-**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.5 tok/s on iPhone 17 Pro** (measured 2026-04-13) · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · EAGLE-3 in training.
+**Status:** ctx=2048 ships at 31 tok/s · ctx=8192 = **14.9 tok/s on iPhone 17 Pro** (PR #7 per-chunk diag, 2026-04-13) · **chunk2 (7 full-attn layers) isolated as the 8K bottleneck at 20.7 ms / 2.96 ms-per-layer, 2× slower than sibling chunks (§0b)** · WFA rejected on quality · W8A8 rejected (ANE compile fails on iPhone) · EAGLE-3 benched on-device, not faster than baseline (distribution mismatch + commit re-runs decode; see `docs/EAGLE3_INTEGRATION_STATE.md`).
 **Goal:** 8K @ 50+ tok/s *without quality loss*, with a documented path to 80+.
-**Updated:** 2026-04-13. iPhone 8K baseline measured. W8A8 confirmed dead on ANE.
+**Updated:** 2026-04-13. iPhone 8K baseline measured. Per-chunk diag shows chunk2 is the single optimization target. W8A8 confirmed dead on ANE.
 
 
 ## Primary design principle: **ANE execution is the product**
@@ -32,6 +32,44 @@ Therefore this document rejects any proposal whose decode path requires CPU/GPU 
 | 4 chunked decode mlpackages | KV-share: L19/24/29/34 read kv14 (shared from L14). |
 
 **Rejected outright:** SDPA fusion · naive WFA (quality NG past FW) · weight-only quant for speed · full GPU-only decode · Medusa (1.3% acc) · Self-speculative without pretraining (0% acc) · TurboQuant 3-bit KV (ANE forces FP16 decomp).
+
+---
+
+## 0b. Measured per-chunk breakdown — iPhone 17 Pro @ 8K (PR #7, 2026-04-13)
+
+Steady-state (iter 3+) from `[Profile]` instrumentation in `ChunkedEngine.swift`:
+
+| Component | ms | Layers | ms / layer | Notes |
+|---|---:|---:|---:|---|
+| emb | 0.9 | — | — | |
+| mask | **0.6** | — | — | pre-alloc PR #6 confirmed a no-op at this scale |
+| chunk1 (L0-7, SWA) | 12.4 | 8 | 1.55 | |
+| **chunk2 (L8-14, full-attn)** | **20.7** | **7** | **2.96** | **2× slower per layer than siblings — the 8K bottleneck** |
+| chunk3 (L15-24, SWA) | 15.2 | 10 | 1.52 | |
+| chunk4 (L25-34, SWA + LM head) | 17.3 | 10 | 1.73 | |
+| sum chunks | 65.7 | 35 | — | |
+| total | 67.0 | — | — | **14.9 tok/s** |
+
+**Interpretation.** chunk2 holds all 7 full-attention layers (L8-14). Each reads `(1,1,8192,512)` × fp16 KV = ~8 MB per layer = ~56 MB per step just for K+V reads. That's the bandwidth-bound hot path that constraint "Current 8K KV: 48 MB" in §0 is warning about — now directly measured.
+
+**Stacked ceiling if chunk2 alone is halved / quartered** (other chunks unchanged):
+
+| chunk2 cost | sum chunks | total | tok/s | vs 14.9 |
+|---:|---:|---:|---:|---:|
+| 20.7 (baseline) | 65.7 | 67.0 | 14.9 | 1.00× |
+| 10.3 (½) | 55.3 | 56.6 | 17.7 | 1.19× |
+| 6.9 (⅓) | 51.9 | 53.2 | 18.8 | 1.27× |
+| 5.2 (¼) | 50.2 | 51.5 | 19.4 | 1.30× |
+
+Even quartering chunk2 only gets ~19 tok/s. To reach the §2 target of 34 tok/s, chunk2 alone isn't enough — either chunk2 must drop near-zero AND the other chunks shrink (EAGLE-3 batches multiple steps per chunk call), OR a speculative / multi-step gain multiplies on top.
+
+**Next action when this session is resumed.** Target chunk2 with a full-attention-layer-specific bandwidth reduction. Three viable approaches, ordered by ROI × implementation cost:
+
+1. **DuoAttention on the 7 full-attn layers only** (Tier A, training-free after offline head classification). Gemma 4 E2B has `num_heads=8` per full-attn layer → classify which heads need full KV vs streaming-window. If ~50% fall to streaming, chunk2 KV halves → ~10 ms → ~18 tok/s. Code in `docs/SPEED_8K.md §1 A1` + Phase 3 of `docs/EAGLE3_INTEGRATION_STATE.md` has the pipeline sketch. Start at `conversion/identify_retrieval_heads.py` (already scaffolded) and `conversion/models/gemma4_swa_chunks.py` (per-head KV budget wiring).
+2. **Block-static TriForce / Quest retrieval on the 7 full-attn layers** (§1 A3/A4). Higher ceiling (~¼ KV read) but needs the block-static top-k redesign to stay ANE. Not started.
+3. **WFA (windowed full attention) on the 7 full-attn layers** (shelved in `docs/EXPERIMENTS.md` for quality regression) — the bandwidth win is proven (chunk2 collapses to SWA-class ~1.5 ms/layer ≈ 10 ms), but quality past the window is unrecoverable without DuoAttention-style per-head classification. Only viable combined with #1.
+
+All three target *the same 7 layers inside chunk2*. Whichever lands, the Swift side needs no change — chunk2.mlpackage gets rebuilt with the new attention variant and dropped in. The instrumentation to confirm impact is already in place (PR #7 `[Profile]` will show chunk2 ms drop directly).
 
 ---
 
@@ -115,8 +153,8 @@ Sorted by ANE feasibility × quality-preservation × ROI. All numbers are from c
 |---|---|---|
 | Pre-alloc masks/RoPE | ✅ pure ANE | Swift-only buffer reuse, ANE graph unchanged |
 | KV-share Q-batching | ✅ pure ANE | Just widens matmul Q dim |
-| INT8 KV cache | ❌ measured no-op on ANE | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. Use full W8A8 instead. |
-| W8A8 | ✅ pure ANE | THE Apple-documented int8-int8 fast path |
+| INT8 KV cache | ❌ ANE-incompatible | CoreML dequantizes INT8 KV to FP16 before ANE compute. Bandwidth halving doesn't materialize. |
+| W8A8 | ❌ ANE-incompatible | coremltools `linear_quantize_activations` emits MIL quant/dequant ops the iPhone ANE compiler rejects. See `docs/EXPERIMENTS.md`. |
 | DuoAttention | ✅ pure ANE | head classification offline; runtime uses 2 static KV banks |
 | EAGLE-3 draft + verify | ✅ pure ANE | small decoder layer, EnumeratedShapes for K=1/3 |
 | StreamingLLM + QLoRA | ✅ pure ANE (after FT) | standard attention post-fine-tune |
@@ -139,16 +177,19 @@ Stacked sequentially (each factor applies to the current baseline):
 ```
              step-speedup    cumulative tok/s @ 8K
 baseline                     15
-+ pre-alloc masks      ×1.07     16
-+ KV-share Q-batch     ×1.08     17
-+ W8A8 proper calib    ×1.40     24     ← opens int8-int8 ANE compute path
-+ DuoAttention (A1)    ×1.50     36     ← quality preserved, training-free
-+ EAGLE-3 (in train)   ×2.00     72     ← fully lossless via verify
++ pre-alloc masks      ×1.00     15     ← measured ~0% on 2K; mask-fill was already sub-ms
++ KV-share Q-batch     ×1.08     16
++ DuoAttention (A1)    ×1.50     24     ← quality preserved, training-free
++ EAGLE-3 (in train)   ×2.00     48     ← fully lossless via verify
 ```
 
-**INT8 KV / KIVI removed from the stack**: measured ineffective on ANE (CoreML dequantizes to FP16 before ANE compute). Only full W8A8 opens the int8-int8 fast path.
+**Pre-alloc** (PR #6) is kept as a cleanup, not a speedup — mask/RoPE prep wasn't on the hot path at 2K. May still help at 8K where masks are 4× larger; not re-measured.
 
-**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~50 tok/s @ 8K** is the realistic landing zone.
+**W8A8 removed from the stack**: coremltools `linear_quantize_activations` inserts MIL quant/dequant ops the iPhone ANE compiler rejects. See `docs/EXPERIMENTS.md` for the dead-end write-up.
+
+**INT8 KV / KIVI removed from the stack**: same ANE-compiler rejection as W8A8, plus CoreML dequantizes to FP16 before ANE compute. No int8-int8 fast path is reachable on ANE today.
+
+**Conservative pessimism adjustment (ANE overhead, non-linear compounding)**: multiply final by 0.70 → **~34 tok/s @ 8K** is the realistic landing zone.
 
 Alternative path replacing EAGLE-3 with TriForce hierarchical:
 ```
@@ -170,9 +211,10 @@ On Colab, 2 epochs × 30k corpus, acc0 tracking 52% @ 7%. Finish, deploy, measur
 > **Status snapshot 2026-04-12**: the `acc0 52% @ 7%` figure is from the most recent `train_eagle_draft.ipynb` / `train_eagle3_draft.ipynb` run (both untracked — the notebooks are still iterated in Colab). Before quoting this number elsewhere, open the latest notebook output cell and verify it still holds. The data-prep and hidden-state collection pipeline is tracked: `conversion/download_eagle_corpus.py` + `conversion/collect_eagle_hidden_states.py`. CoreML export of the draft model goes through `conversion/build_speculative.py` (modified, not yet merged). See `docs/EXPERIMENTS.md` for the abandoned Medusa comparison that motivated choosing EAGLE-3.
 
 ### Parallel track P2 — ANE bandwidth reduction (training-free, fastest ROI)
-1. **Pre-allocate masks/umask/RoPE** in `ChunkedEngine.swift:303-309, 554-576` (trivial).
-2. **KV-share Q-batching** for L19/24/29/34 in `gemma4_swa_chunks.py:140` (~40 LoC).
-3. **INT8 KV cache** — quantize K (per-channel) and V (per-token) to INT8 at cache-write time, dequantize at cache-read. CoreML path: post-conversion surgery, keep KV I/O as int8 arrays. Validate quality vs FP16 baseline.
+1. ~~**Pre-allocate masks/umask/RoPE**~~ — landed (PR #6) but measured no-op (§0b). Mask-fill was already sub-ms. Kept for cleanup.
+2. **KV-share Q-batching** for L19/24/29/34 in `gemma4_swa_chunks.py:140` (~40 LoC). Still applicable; targets chunk3/4 shared-KV reads.
+3. ~~**INT8 KV cache**~~ — rejected: coremltools dequantizes to FP16 before ANE compute (§1b). No bandwidth win on ANE.
+4. **chunk2 bandwidth reduction (NEW priority)** — the measured 8K bottleneck (§0b: 20.7 ms, 2.96 ms/layer). See §0b "Next action" for the three candidates (DuoAttention heads / block-static TriForce / WFA+DuoAttention combo). Target: chunk2 → ≤10 ms.
 
 ### Parallel track P3 — DuoAttention head identification
 1. Port DuoAttention training script to Gemma 4 E2B (setup: BookSum data, ~4-8h on A100).
